@@ -36,8 +36,11 @@ static int avm_querycap(struct file *file, void *fh,
 	strscpy(cap->card, "AVerMedia ExtremeCap U3 (CV710)",
 		sizeof(cap->card));
 	usb_make_path(dev->udev, cap->bus_info, sizeof(cap->bus_info));
+	/* NOTE: V4L2_CAP_TIMEPERFRAME must NOT appear here - it aliases
+	 * V4L2_CAP_VIDEO_CAPTURE_MPLANE (both are 0x1000) and would make
+	 * tools probe a Multiplanar queue we do not provide. */
 	cap->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING |
-			   V4L2_CAP_READWRITE | V4L2_CAP_TIMEPERFRAME;
+			   V4L2_CAP_READWRITE;
 	cap->capabilities = cap->device_caps | V4L2_CAP_DEVICE_CAPS;
 	return 0;
 }
@@ -415,7 +418,7 @@ int avm_video_register(struct avm_device *dev)
 	vdev->queue = &dev->q;
 	vdev->lock = &dev->stream_lock;
 	vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING |
-			    V4L2_CAP_READWRITE | V4L2_CAP_TIMEPERFRAME;
+			    V4L2_CAP_READWRITE;
 	strscpy(vdev->name, "AVerMedia ExtremeCap U3 (CV710)",
 		sizeof(vdev->name));
 	video_set_drvdata(vdev, dev);

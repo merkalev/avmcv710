@@ -130,6 +130,84 @@ static int avm_s_fmt(struct file *file, void *fh, struct v4l2_format *f)
 	return 0;
 }
 
+/* Single HDMI input. */
+static int avm_enum_input(struct file *file, void *fh,
+			  struct v4l2_input *inp)
+{
+	if (inp->index != 0)
+		return -EINVAL;
+	memset(inp, 0, sizeof(*inp));
+	strscpy(inp->name, "HDMI", sizeof(inp->name));
+	inp->type = V4L2_INPUT_TYPE_CAMERA;
+	return 0;
+}
+
+static int avm_g_input(struct file *file, void *fh, unsigned int *index)
+{
+	*index = 0;
+	return 0;
+}
+
+static int avm_s_input(struct file *file, void *fh, unsigned int index)
+{
+	return index == 0 ? 0 : -EINVAL;
+}
+
+/*
+ * Source-paced capture: the geometry (and frame rate) is whatever the HDMI
+ * source locks, so the only honest enumeration is the currently detected
+ * size / the nominal 30fps capture interval.
+ */
+static int avm_enum_framesizes(struct file *file, void *fh,
+			       struct v4l2_frmsizeenum *fsize)
+{
+	struct avm_device *dev = video_drvdata(file);
+	u32 w, h;
+
+	if (fsize->index != 0)
+		return -EINVAL;
+	if (fsize->pixel_format != V4L2_PIX_FMT_YUYV)
+		return -EINVAL;
+
+	w = READ_ONCE(dev->parser.active_w);
+	h = READ_ONCE(dev->parser.active_h);
+	if (!w || !h) {
+		w = 1920;
+		h = 1080;
+	}
+	fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
+	fsize->discrete.width = w;
+	fsize->discrete.height = h;
+	return 0;
+}
+
+static int avm_enum_frameintervals(struct file *file, void *fh,
+				   struct v4l2_frmivalenum *fiv)
+{
+	if (fiv->index != 0)
+		return -EINVAL;
+	fiv->type = V4L2_FRMIVAL_TYPE_DISCRETE;
+	fiv->discrete.numerator = 1;
+	fiv->discrete.denominator = 30;
+	return 0;
+}
+
+static int avm_g_parm(struct file *file, void *fh, struct v4l2_streamparm *p)
+{
+	if (p->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+		return -EINVAL;
+	p->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
+	p->parm.capture.timeperframe.numerator = 1;
+	p->parm.capture.timeperframe.denominator = 30;
+	return 0;
+}
+
+static int avm_s_parm(struct file *file, void *fh, struct v4l2_streamparm *p)
+{
+	/* source-paced: report the nominal interval, accept any request */
+	return avm_g_parm(file, fh, p);
+}
+
 static const struct v4l2_file_operations avm_fops = {
 	.owner		= THIS_MODULE,
 	.open		= v4l2_fh_open,
@@ -146,7 +224,15 @@ static const struct v4l2_ioctl_ops avm_ioctl_ops = {
 	.vidioc_g_fmt_vid_cap	= avm_g_fmt,
 	.vidioc_try_fmt_vid_cap = avm_try_fmt,
 	.vidioc_s_fmt_vid_cap	= avm_s_fmt,
+	.vidioc_enum_input	= avm_enum_input,
+	.vidioc_g_input		= avm_g_input,
+	.vidioc_s_input		= avm_s_input,
+	.vidioc_enum_framesizes	= avm_enum_framesizes,
+	.vidioc_enum_frameintervals = avm_enum_frameintervals,
+	.vidioc_g_parm		= avm_g_parm,
+	.vidioc_s_parm		= avm_s_parm,
 	.vidioc_reqbufs		= vb2_ioctl_reqbufs,
+	.vidioc_create_bufs	= vb2_ioctl_create_bufs,
 	.vidioc_querybuf	= vb2_ioctl_querybuf,
 	.vidioc_qbuf		= vb2_ioctl_qbuf,
 	.vidioc_dqbuf		= vb2_ioctl_dqbuf,
@@ -326,7 +412,7 @@ int avm_video_register(struct avm_device *dev)
 	vdev->queue = &dev->q;
 	vdev->lock = &dev->stream_lock;
 	vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING |
-			    V4L2_CAP_READWRITE;
+			    V4L2_CAP_READWRITE | V4L2_CAP_TIMEPERFRAME;
 	strscpy(vdev->name, "AVerMedia ExtremeCap U3 (CV710)",
 		sizeof(vdev->name));
 	video_set_drvdata(vdev, dev);

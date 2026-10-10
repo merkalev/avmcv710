@@ -217,7 +217,10 @@ static int avm_usb_probe(struct usb_interface *intf,
 	if (ret)
 		goto err_free;
 
-	dev->wq = alloc_workqueue("avmcv710", WQ_MEM_RECLAIM, 1);
+	/* Single-threaded, unbounded: parser runs are serialized and never
+	 * block a CPU-bound worker pool; explicit flags keep newer kernels
+	 * from warning about an ambiguous per-cpu/unbound workqueue. */
+	dev->wq = alloc_ordered_workqueue("avmcv710", WQ_MEM_RECLAIM);
 	if (!dev->wq) {
 		ret = -ENOMEM;
 		goto err_urbs;

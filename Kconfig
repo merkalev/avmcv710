@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# AVerMedia ExtremeCap U3 (CV710) USB capture driver
+#
+# In-tree placement: drivers/media/usb/avmcv710/
+
+config VIDEO_AVMCV710
+	tristate "AVerMedia ExtremeCap U3 (CV710) USB capture support"
+	depends on USB && VIDEO_DEV
+	select VIDEOBUF2_VMALLOC
+	help
+	  Say Y here to enable support for the AVerMedia ExtremeCap U3
+	  (CV710 / C877, USB ID 07ca:0710).
+
+	  The device is a Cypress FX3 (CYUSB3014) USB 3.0 controller paired
+	  with an Analog Devices ADV7604 HDMI receiver and a Lattice ECP3
+	  FPGA that serializes the pixel/audio stream into a custom bulk
+	  framing (C0/C1 video markers + 0x58 audio packets) spoken over
+	  USB bulk endpoint 0x83.  See PROTOCOL.md in the companion
+	  userspace analysis project for the wire format.
+
+	  This driver brings the hardware up by replaying the reverse
+	  engineered FX3/ADV7604 bootstrap sequence, then exposes a V4L2
+	  YUY2 capture device with automatic resolution detection.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be called avmcv710.
+
+if VIDEO_AVMCV710
+endif # VIDEO_AVMCV710

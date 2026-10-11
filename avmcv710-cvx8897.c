@@ -19,6 +19,7 @@
  */
 #include <linux/delay.h>
 #include <linux/kernel.h>
+#include <linux/moduleparam.h>
 
 #include "avmcv710.h"
 #include "avmcv710-cvx8897.h"
@@ -165,4 +166,136 @@ const u8 *avm_cvx8897_half_rate(u32 w, u32 h, u32 fps, bool rgb, bool interlaced
 		return avm_cvx_800_600_60P_422_To_800_600_30P_422;
 
 	return NULL;
+}
+
+/*
+ * Frame-rate conversion is opt-in.  The decision needs the *input* rate (to
+ * tell "half the source" from "the source rate"), and Stage 0 runs no ADV7604
+ * poll, so it is inferred from the delivered rate while the converter is
+ * native.  0 = leave the converter alone (default); 1 = follow s_parm and
+ * halve the rate when the consumer asks for about half the source rate.
+ * Writable at runtime via /sys/module/avmcv710/parameters/cvx8897.
+ */
+static int cvx8897;
+module_param(cvx8897, int, 0644);
+MODULE_PARM_DESC(cvx8897,
+	"CVX8897 frame-rate conversion: 0=off (default), 1=follow s_parm");
+
+bool avm_cvx8897_enabled(void)
+{
+	return cvx8897 != 0;
+}
+
+static void avm_cvx_work(struct work_struct *work)
+{
+	struct avm_device *dev = container_of(work, struct avm_device, cvx_work);
+	struct avm_parser *p = &dev->parser;
+	const u8 *table;
+	u32 w, h, in_fps, req, serial;
+	bool interlaced, want_half;
+	int ret, failures;
+
+	if (!cvx8897)
+		return;
+
+	w = READ_ONCE(p->active_w);
+	h = READ_ONCE(p->active_h);
+	in_fps = READ_ONCE(p->measured_fps);
+	interlaced = READ_ONCE(p->active_interlaced);
+	serial = READ_ONCE(p->mode_serial);
+	req = READ_ONCE(dev->cvx_req_fps);
+
+	/* Need a locked geometry and a measured rate. */
+	if (!w || !h || !in_fps)
+		return;
+
+	/*
+	 * While halving, measured_fps is the delivered rate; recover the input
+	 * rate for the decision (and for re-selection after a mode switch that
+	 * happens while converted).
+	 */
+	if (dev->cvx_prog_half)
+		in_fps *= 2;
+
+	/*
+	 * "Select N fps": convert only when the consumer asks for about half
+	 * the input rate.  Asking for the input rate itself - or anything
+	 * else, or nothing - means native passthrough.
+	 */
+	want_half = req && req != in_fps &&
+		    req * 2 >= in_fps - in_fps / 8 &&
+		    req * 2 <= in_fps + in_fps / 8;
+
+	table = want_half ?
+		avm_cvx8897_half_rate(w, h, in_fps, false, interlaced) : NULL;
+	if (!table)
+		want_half = false;
+
+	if (want_half) {
+		if (dev->cvx_prog_half && dev->cvx_prog_serial == serial)
+			return;		/* already programmed for this input */
+		dev_info(&dev->udev->dev, "cvx8897: halving %ux%u@%u\n",
+			 w, h, in_fps);
+		ret = avm_cvx8897_set_mode(dev, true);
+		if (ret) {
+			dev_warn_ratelimited(&dev->udev->dev,
+					"cvx8897: SetMode(half) failed: %d\n",
+					ret);
+			return;
+		}
+		failures = avm_cvx8897_apply(dev, table);
+		dev->cvx_prog_half = true;
+		dev->cvx_prog_serial = serial;
+		if (failures)
+			dev_warn_ratelimited(&dev->udev->dev,
+					"cvx8897: %d/%u writes failed\n",
+					failures, AVM_CVX_REG_COUNT);
+		return;
+	}
+
+	/* Native passthrough.  The bootstrap leaves the converter native, so
+	 * there is nothing to do unless a previous stream selected half. */
+	if (!dev->cvx_prog_half)
+		return;
+	dev_info(&dev->udev->dev, "cvx8897: restoring native %ux%u@%u\n",
+		 w, h, in_fps);
+	ret = avm_cvx8897_set_mode(dev, false);
+	dev->cvx_prog_half = false;
+	dev->cvx_prog_serial = serial;
+	if (ret)
+		dev_warn_ratelimited(&dev->udev->dev,
+				"cvx8897: SetMode(native) failed: %d\n", ret);
+}
+
+void avm_cvx8897_kick(struct avm_device *dev)
+{
+	if (!dev->cvx_wq)
+		return;
+	queue_work(dev->cvx_wq, &dev->cvx_work);
+}
+
+void avm_cvx8897_request_fps(struct avm_device *dev, u32 fps)
+{
+	if (fps > 240)
+		fps = 0;		/* bogus: treat as "not requested" */
+	WRITE_ONCE(dev->cvx_req_fps, fps);
+	avm_cvx8897_kick(dev);
+}
+
+int avm_cvx8897_init(struct avm_device *dev)
+{
+	dev->cvx_wq = alloc_ordered_workqueue("avmcv710-cvx", 0);
+	if (!dev->cvx_wq)
+		return -ENOMEM;
+	INIT_WORK(&dev->cvx_work, avm_cvx_work);
+	return 0;
+}
+
+void avm_cvx8897_fini(struct avm_device *dev)
+{
+	if (!dev->cvx_wq)
+		return;
+	cancel_work_sync(&dev->cvx_work);
+	destroy_workqueue(dev->cvx_wq);
+	dev->cvx_wq = NULL;
 }

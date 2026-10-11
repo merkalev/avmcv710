@@ -270,6 +270,10 @@ static void avm_note_frame(struct avm_parser *p)
 				p->measured_fps = 0; /* bogus: let it settle */
 			p->fps_cnt = 0;
 			p->fps_t0 = 0;
+			/* A fresh rate snapshot may let the CVX8897 converter
+			 * decide (it needs the input rate). */
+			avm_cvx8897_kick(container_of(p, struct avm_device,
+						     parser));
 		}
 	}
 }
@@ -440,6 +444,7 @@ static void avm_handle_frame_end(struct avm_device *dev, u32 frame_words)
 		if (p->pending_count >= 4) {
 			p->active_w = mode->w;
 			p->active_h = mode->h;
+			p->active_interlaced = mode->interlaced;
 			p->pending_count = 0;
 			p->mode_serial++;
 			/* tell consumers to re-negotiate the format */

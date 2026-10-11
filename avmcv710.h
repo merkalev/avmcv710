@@ -114,6 +114,7 @@ struct avm_parser {
 	/* mode hysteresis (needs 4 consecutive matching frames) */
 	u32 pending_w, pending_h, pending_count;
 	u32 active_w, active_h;
+	bool active_interlaced;	/* locked mode is interlaced */
 	u32 target_words;	/* words expected for active mode */
 	unsigned int mode_serial; /* bumped on each locked switch */
 	u32 frame_sequence;	/* DQBUF sequence counter (V4L2_BUF.sequence) */
@@ -181,6 +182,15 @@ struct avm_device {
 	/* USB plumbing */
 	struct usb_anchor urb_anchor;	/* anchored streaming URBs */
 	bool bootstrapped;
+
+	/* CVX8897 frame-rate converter (avmcv710-cvx8897.c).  The converter
+	 * worker runs on its own workqueue because programming it sleeps ~3 s
+	 * and must not stall the parser. */
+	struct workqueue_struct *cvx_wq;
+	struct work_struct cvx_work;
+	u32 cvx_req_fps;	/* consumer-requested rate (0 = none) */
+	bool cvx_prog_half;	/* converter currently set to half rate */
+	u32 cvx_prog_serial;	/* parser mode_serial when last programmed */
 };
 
 /* avmcv710-hw.c */
@@ -199,6 +209,11 @@ const u8 *avm_cvx8897_half_rate(u32 w, u32 h, u32 fps, bool rgb,
 				bool interlaced);
 int avm_cvx8897_apply(struct avm_device *dev, const u8 *values);
 int avm_cvx8897_set_mode(struct avm_device *dev, bool converted);
+int avm_cvx8897_init(struct avm_device *dev);
+void avm_cvx8897_fini(struct avm_device *dev);
+void avm_cvx8897_kick(struct avm_device *dev);
+void avm_cvx8897_request_fps(struct avm_device *dev, u32 fps);
+bool avm_cvx8897_enabled(void);
 
 /* avmcv710-video.c */
 int avm_video_register(struct avm_device *dev);

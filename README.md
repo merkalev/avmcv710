@@ -109,6 +109,23 @@ The frame word count / geometry auto-detection means the driver delivers
 whatever the HDMI source produces; if the picture is wrong, check the source's
 output mode first.
 
+### Frame rate (CVX8897 converter)
+
+Hardware frame-rate conversion is opt-in, because deciding "half the source
+rate" needs the *input* rate and Stage 0 has no receiver poll (it is inferred
+from the delivered rate while the converter is native):
+
+```
+# 0 = off (default), 1 = follow S_PARM (halve when asked for half the source)
+sudo modprobe avmcv710 cvx8897=1
+echo 1 | sudo tee /sys/module/avmcv710/parameters/cvx8897   # runtime, no reload
+```
+
+With the converter enabled, `enum_frameintervals()` offers the real
+60/50/30/25/24/15 menu (S_PARM selects the matching half-rate table for
+60 Hz / 50 Hz progressive sources); with it off, the source paces the cadence
+and S_PARM cannot retime it. The converter never scales geometry.
+
 ## Driver internals / file map
 
 | File | Role |
@@ -118,7 +135,9 @@ output mode first.
 | `avmcv710-parser.c` | C0/C1/audio framing parser, mode detect, weaving, delivery |
 | `avmcv710-usb.c` | probe/disconnect, URB pipeline, parse workqueue, teardown |
 | `avmcv710-video.c` | V4L2 + vb2 queue, format negotiation, streaming lifecycle |
+| `avmcv710-cvx8897.c` | CVX8897 frame-rate converter (opt-in 60→30 / 50→25) |
 | `tools/gen_bootstrap.py` | generates `avmcv710-bootstrap.h` from the original trace |
+| `tools/gen_cvx8897.py` | generates `avmcv710-cvx8897.h` from the userspace tables |
 
 Protocol details (markers, checksums, chunk size, HDCP notes) are documented
 in the userspace repo's `PROTOCOL.md`.

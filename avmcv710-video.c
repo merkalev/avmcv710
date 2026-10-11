@@ -27,13 +27,17 @@ static inline struct avm_buffer *to_avm_buffer(struct vb2_buffer *vb)
 }
 
 /*
- * Source-paced capture: the geometry (and frame rate) is whatever the HDMI
- * source locks.  The FPGA passes the raster through and cannot scale on its
- * own - the vendor's multi-resolution menu is really the CVX8897 converter,
- * which this driver does not program - so a requested size can never be
- * honoured and every format ioctl reports the live geometry (avm_pixfmt()).
- * enum_framesizes()/enum_frameintervals() advertise that live value only,
- * instead of a menu of entries that would silently come back as the source.
+ * Source-paced capture: the geometry is whatever the HDMI source locks.  The
+ * FPGA passes the raster through and cannot scale, so a requested size can
+ * never be honoured and every format ioctl reports the live geometry
+ * (avm_pixfmt()).  enum_framesizes() therefore advertises that one live size.
+ *
+ * The frame rate is different: the CVX8897 between the receiver and the
+ * capture path can halve it in hardware (the vendor's [60p]/[30p]/[50p]/[25p]
+ * "Video Input Frame Rate" selector).  When that converter is enabled
+ * (avmcv710-cvx8897.c), enum_frameintervals() offers its real menu and S_PARM
+ * selects the matching half-rate table; otherwise the source paces the
+ * cadence and only the measured interval is honest.
  */
 
 /* ------------------------------------------------------------------ */
@@ -229,6 +233,18 @@ static void avm_current_interval(struct avm_device *dev,
 	tpf->denominator = fps;
 }
 
+/* Nominal rates the CVX8897 can deliver: the 60/50 Hz families and their
+ * halves.  Offered only when conversion is enabled - otherwise the source
+ * paces the cadence and S_PARM cannot retime it. */
+static const struct v4l2_fract avm_intervals[] = {
+	{ 1, 60 },	/* 60.00 */
+	{ 1, 50 },	/* 50.00 */
+	{ 1, 30 },	/* 29.97-ish */
+	{ 1, 25 },	/* 25.00 */
+	{ 1, 24 },	/* 23.98-ish */
+	{ 1, 15 },	/* 15.00 */
+};
+
 static int avm_enum_frameintervals(struct file *file, void *fh,
 				   struct v4l2_frmivalenum *fiv)
 {
@@ -237,13 +253,20 @@ static int avm_enum_frameintervals(struct file *file, void *fh,
 	if (fiv->pixel_format != V4L2_PIX_FMT_YUYV)
 		return -EINVAL;
 	/*
-	 * Same reasoning as enum_framesizes(): the source paces the cadence
-	 * and S_PARM cannot retime it, so only the measured rate is real.  The
-	 * old 60/50/30/25/24/15 menu looked selectable but did nothing.
+	 * With the CVX8897 converter enabled the menu is real (S_PARM selects
+	 * the half-rate table); without it the source paces the cadence and
+	 * only the measured rate is honest.
 	 */
+	if (avm_cvx8897_enabled()) {
+		if (fiv->index >= ARRAY_SIZE(avm_intervals))
+			return -EINVAL;
+		fiv->type = V4L2_FRMIVAL_TYPE_DISCRETE;
+		fiv->discrete = avm_intervals[fiv->index];
+		return 0;
+	}
+
 	if (fiv->index > 0)
 		return -EINVAL;
-
 	fiv->type = V4L2_FRMIVAL_TYPE_DISCRETE;
 	avm_current_interval(dev, &fiv->discrete);
 	return 0;
@@ -263,7 +286,19 @@ static int avm_g_parm(struct file *file, void *fh, struct v4l2_streamparm *p)
 
 static int avm_s_parm(struct file *file, void *fh, struct v4l2_streamparm *p)
 {
-	/* source-paced: report the nominal interval, accept any request */
+	struct avm_device *dev = video_drvdata(file);
+
+	if (p->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+		return -EINVAL;
+	/*
+	 * The source paces the cadence, but the CVX8897 can halve it in
+	 * hardware.  Record the requested rate so the converter worker can
+	 * pick the matching half-rate table (or stay native).
+	 */
+	if (p->parm.capture.timeperframe.numerator)
+		avm_cvx8897_request_fps(dev,
+			p->parm.capture.timeperframe.denominator /
+			p->parm.capture.timeperframe.numerator);
 	return avm_g_parm(file, fh, p);
 }
 
@@ -281,6 +316,8 @@ void avm_source_change(struct avm_device *dev)
 	};
 
 	v4l2_event_queue(&dev->vdev, &ev);
+	/* A new locked input may need a different converter table. */
+	avm_cvx8897_kick(dev);
 }
 
 static int avm_subscribe_event(struct v4l2_fh *fh,

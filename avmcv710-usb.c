@@ -69,6 +69,7 @@ void avm_return_buffers(struct avm_device *dev, enum vb2_buffer_state state)
  * every open file handle on the video node has been closed. */
 void avm_usb_release(struct avm_device *dev)
 {
+	avm_cvx8897_fini(dev);
 	destroy_workqueue(dev->wq);
 	avm_free_urbs(dev);
 }
@@ -280,6 +281,10 @@ static int avm_usb_probe(struct usb_interface *intf,
 	}
 	INIT_WORK(&dev->parse_work, avm_parse_work);
 
+	ret = avm_cvx8897_init(dev);
+	if (ret)
+		goto err_wq;
+
 	/*
 	 * Replay the 871-command FX3/ADV7604 bring-up (bulk EP1).
 	 *
@@ -349,6 +354,7 @@ static int avm_usb_probe(struct usb_interface *intf,
 	return 0;
 
 err_wq:
+	avm_cvx8897_fini(dev);
 	destroy_workqueue(dev->wq);
 err_urbs:
 	avm_free_urbs(dev);
@@ -379,6 +385,7 @@ static void avm_usb_disconnect(struct usb_interface *intf)
 	mutex_unlock(&dev->stream_lock);
 
 	usb_kill_anchored_urbs(&dev->urb_anchor);
+	cancel_work_sync(&dev->cvx_work);
 	flush_workqueue(dev->wq);
 
 	/*

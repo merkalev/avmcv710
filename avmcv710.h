@@ -201,6 +201,7 @@ int avm_reset_stream_dma(struct avm_device *dev);
 
 /* avmcv710-video.c */
 int avm_video_register(struct avm_device *dev);
+void avm_source_change(struct avm_device *dev);
 
 /* avmcv710-usb.c */
 void avm_return_buffers(struct avm_device *dev);

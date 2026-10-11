@@ -13,6 +13,7 @@
 #include <linux/slab.h>
 #include <linux/usb.h>
 #include <media/v4l2-dev.h>
+#include <media/v4l2-event.h>
 #include <media/v4l2-ioctl.h>
 #include <media/videobuf2-v4l2.h>
 #include <media/videobuf2-vmalloc.h>
@@ -26,10 +27,9 @@ static inline struct avm_buffer *to_avm_buffer(struct vb2_buffer *vb)
 
 /*
  * Source-paced capture: the geometry (and frame rate) is whatever the HDMI
- * source locks.  Only these four geometries are supported; expose exactly
- * them and snap any TRY_FMT to the nearest one so a consumer cannot force a
- * size the device cannot produce (forcing one only makes the device show
- * its internal OUT-OF-RANGE bitmap and the parser drops those frames).
+ * source locks.  A requested size can never be honoured, so every format
+ * ioctl reports the live geometry (see avm_pixfmt()); these standard sink
+ * geometries are offered by enum_framesizes() as additional menu entries.
  */
 struct avm_fsize {
 	u32 w, h;
@@ -42,25 +42,6 @@ static const struct avm_fsize avm_sizes[] = {
 	{  720,  480 },
 	{  640,  480 },
 };
-
-static const struct avm_fsize *avm_nearest_size(u32 w, u32 h)
-{
-	const struct avm_fsize *best = &avm_sizes[0];
-	u64 best_d = U64_MAX;
-	int i;
-
-	for (i = 0; i < ARRAY_SIZE(avm_sizes); i++) {
-		long dw = (long)avm_sizes[i].w - w;
-		long dh = (long)avm_sizes[i].h - h;
-		u64 d = (u64)(dw * dw) + (u64)(dh * dh);
-
-		if (d < best_d) {
-			best_d = d;
-			best = &avm_sizes[i];
-		}
-	}
-	return best;
-}
 
 /* ------------------------------------------------------------------ */
 /* v4l2 ioctls                                                         */
@@ -93,11 +74,14 @@ static int avm_enum_fmt(struct file *file, void *fh,
 }
 
 /* Current detected geometry (falls back to the ADV7604 measurement before
- * the first frame locks, then 1920x1080). */
+ * the first frame locks, then 1920x1080).  Always reports the *frame*
+ * geometry: the receiver may report only the field height for interlaced
+ * input, so double a short (< 700) measured height. */
 static void avm_pixfmt(struct avm_device *dev, struct v4l2_pix_format *pix)
 {
 	u32 w = READ_ONCE(dev->parser.active_w);
 	u32 h = READ_ONCE(dev->parser.active_h);
+	bool interlaced = false;
 	unsigned long flags;
 
 	if (!w || !h) {
@@ -107,12 +91,15 @@ static void avm_pixfmt(struct avm_device *dev, struct v4l2_pix_format *pix)
 		    dev->sig.h >= 120 && dev->sig.h <= 2048) {
 			w = dev->sig.w;
 			h = dev->sig.h;
+			interlaced = dev->sig.interlaced;
 		}
 		spin_unlock_irqrestore(&dev->sig_lock, flags);
 	}
 	if (!w || !h) {
 		w = 1920;
 		h = 1080;
+	} else if (interlaced && h <= 700) {
+		h *= 2;
 	}
 
 	pix->width = w;
@@ -143,29 +130,16 @@ static int avm_try_fmt(struct file *file, void *fh, struct v4l2_format *f)
 	if (f->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 		return -EINVAL;
 
-	if (pix->pixelformat != V4L2_PIX_FMT_YUYV) {
-		/* auto-detect: report the current locked geometry */
-		avm_pixfmt(dev, pix);
-		return 0;
-	}
-
-	/* Accept only the supported geometries; snap to the nearest one. */
-	if (pix->width == 0 || pix->height == 0) {
-		avm_pixfmt(dev, pix);
-		return 0;
-	}
-	{
-		const struct avm_fsize *f = avm_nearest_size(pix->width,
-							     pix->height);
-
-		pix->width = f->w;
-		pix->height = f->h;
-	}
-	pix->field = V4L2_FIELD_NONE;
-	pix->bytesperline = pix->width * 2;
-	pix->sizeimage = pix->width * pix->height * 2;
-	pix->colorspace = V4L2_COLORSPACE_SMPTE170M;
-	pix->priv = 0;
+	/*
+	 * Source-paced: the geometry is whatever the HDMI source locks, so a
+	 * requested size cannot be honoured.  Always report the current
+	 * geometry so the negotiated bytesperline/sizeimage match what the
+	 * parser actually delivers - otherwise a consumer that asked for
+	 * 1920x1080 but receives a 1366x768 payload would read it with the
+	 * wrong stride and shear the picture.  A consumer learns about a
+	 * change through V4L2_EVENT_SOURCE_CHANGE and re-queries g_fmt.
+	 */
+	avm_pixfmt(dev, pix);
 	return 0;
 }
 
@@ -212,14 +186,40 @@ static int avm_s_input(struct file *file, void *fh, unsigned int index)
 static int avm_enum_framesizes(struct file *file, void *fh,
 			       struct v4l2_frmsizeenum *fsize)
 {
-	if (fsize->index >= ARRAY_SIZE(avm_sizes))
-		return -EINVAL;
+	struct avm_device *dev = video_drvdata(file);
+	struct v4l2_pix_format pix;
+	unsigned int i, extra = 0;
+
 	if (fsize->pixel_format != V4L2_PIX_FMT_YUYV)
 		return -EINVAL;
 
+	/*
+	 * The live source geometry is entry 0 (it may be a non-table size such
+	 * as 1366x768); the standard sink geometries follow, with a duplicate
+	 * skipped when the live size already is one of them.
+	 */
+	avm_pixfmt(dev, &pix);
+	for (i = 0; i < ARRAY_SIZE(avm_sizes); i++) {
+		if (avm_sizes[i].w == pix.width &&
+		    avm_sizes[i].h == pix.height)
+			break;
+	}
+	if (i == ARRAY_SIZE(avm_sizes))
+		extra = 1;
+
+	if (fsize->index < extra) {
+		fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
+		fsize->discrete.width = pix.width;
+		fsize->discrete.height = pix.height;
+		return 0;
+	}
+	i = fsize->index - extra;
+	if (i >= ARRAY_SIZE(avm_sizes))
+		return -EINVAL;
+
 	fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
-	fsize->discrete.width = avm_sizes[fsize->index].w;
-	fsize->discrete.height = avm_sizes[fsize->index].h;
+	fsize->discrete.width = avm_sizes[i].w;
+	fsize->discrete.height = avm_sizes[i].h;
 	return 0;
 }
 
@@ -275,6 +275,36 @@ static int avm_s_parm(struct file *file, void *fh, struct v4l2_streamparm *p)
 	return avm_g_parm(file, fh, p);
 }
 
+/*
+ * V4L2_EVENT_SOURCE_CHANGE is queued from the parser worker whenever the
+ * locked geometry changes (avm_source_change), so a consumer re-queries
+ * g_fmt/S_FMT instead of reading the new raster with the old stride - the
+ * resolution-switch freeze/hang the official-driver model avoids.
+ */
+void avm_source_change(struct avm_device *dev)
+{
+	static const struct v4l2_event ev = {
+		.type = V4L2_EVENT_SOURCE_CHANGE,
+		.u.src_change.changes = V4L2_EVENT_SRC_CH_RESOLUTION,
+	};
+
+	v4l2_event_queue(&dev->vdev, &ev);
+}
+
+static int avm_subscribe_event(struct v4l2_fh *fh,
+			       const struct v4l2_event_subscription *sub)
+{
+	if (sub->type != V4L2_EVENT_SOURCE_CHANGE)
+		return -EINVAL;
+	return v4l2_event_subscribe(fh, sub, 0, NULL);
+}
+
+static int avm_unsubscribe_event(struct v4l2_fh *fh,
+				 const struct v4l2_event_subscription *sub)
+{
+	return v4l2_event_unsubscribe(fh, sub);
+}
+
 static const struct v4l2_file_operations avm_fops = {
 	.owner		= THIS_MODULE,
 	.open		= v4l2_fh_open,
@@ -305,6 +335,8 @@ static const struct v4l2_ioctl_ops avm_ioctl_ops = {
 	.vidioc_dqbuf		= vb2_ioctl_dqbuf,
 	.vidioc_streamon	= vb2_ioctl_streamon,
 	.vidioc_streamoff	= vb2_ioctl_streamoff,
+	.vidioc_subscribe_event	= avm_subscribe_event,
+	.vidioc_unsubscribe_event = avm_unsubscribe_event,
 };
 
 /* ------------------------------------------------------------------ */

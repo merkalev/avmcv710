@@ -433,6 +433,8 @@ static void avm_handle_frame_end(struct avm_device *dev, u32 frame_words)
 			p->active_h = mode->h;
 			p->pending_count = 0;
 			p->mode_serial++;
+			/* tell consumers to re-negotiate the format */
+			avm_source_change(dev);
 			mode_w_changed = false;
 		}
 	}

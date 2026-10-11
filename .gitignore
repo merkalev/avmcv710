@@ -12,3 +12,5 @@ modules.order
 .*.cmd
 *.o.d
 .tmp_versions/
+# generated overlay header (tools/gen_bmp.py)
+avmcv710-bmp.h

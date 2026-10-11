@@ -44,15 +44,79 @@ static const struct avm_mode avm_modes[] = {
 	{  720,  480,   86400, "480i ", true  },   /* field words */
 };
 
+/* Scratch mode for the adaptive path (single parser worker, no nesting). */
+static struct avm_mode avm_meas_mode;
+
 /*
- * Map an observed frame/field word count to a mode.  The original
- * userspace fallback table is kept verbatim (including the two 720p bands;
- * the 1080i field band and the 526k-545k 720p band only touch near their
- * edges and the userspace driver accepted that overlap for years).
+ * Map an observed frame/field word count to a mode.
+ *
+ * 1. Adaptive path first: when the ADV7604 status worker has locked TMDS
+ *    and measured a geometry, accept any frame that matches it (within the
+ *    same tolerances as the userspace driver, Device::detectVideoMode).
+ *    This is what makes non-table sources work: 1366x768, 1280x1024,
+ *    VGA-style timings from cheap TV boxes, etc. - the FPGA passes the
+ *    receiver's raster straight through, so the word count alone is only a
+ *    hint and the measured geometry is authoritative.
+ *
+ * 2. Fallback table: the standard modes, verbatim from the userspace
+ *    driver (including the two 720p bands; the 1080i field band and the
+ *    526k-545k 720p band only touch near their edges and the userspace
+ *    driver accepted that overlap for years).
  */
-static const struct avm_mode *avm_detect_mode(u32 words)
+static const struct avm_mode *avm_detect_mode(struct avm_device *dev,
+					      u32 words,
+					      bool hw_interlaced)
 {
+	struct avm_signal sig;
+	unsigned long flags;
 	unsigned int i;
+
+	spin_lock_irqsave(&dev->sig_lock, flags);
+	sig = dev->sig;
+	spin_unlock_irqrestore(&dev->sig_lock, flags);
+
+	if (sig.valid && sig.tmds_locked && sig.w >= 320 && sig.w <= 4095 &&
+	    sig.h >= 120 && sig.h <= 2048 && (sig.w & 1) == 0) {
+		bool interlaced = hw_interlaced || sig.interlaced;
+
+		/* Tie-breaker: if both scan-mode sources are clear or stale,
+		 * the distinctive per-field word counts of the standard
+		 * interlaced modes still identify a field stream - otherwise
+		 * a 1080i field would be misclassified as a 1920x540
+		 * progressive frame (same guard as the userspace driver). */
+		if (!interlaced &&
+		    ((words >= 510000 && words <= 524000) ||
+		     (words >=  98000 && words <= 110000) ||
+		     (words >=  80000 && words <=  92000)))
+			interlaced = true;
+
+		if (interlaced) {
+			u32 field_h = (words * 2) / sig.w;
+
+			/* field word count must be an exact w*fieldH/2 */
+			if (field_h >= 100 && field_h <= 700 &&
+			    (u64)sig.w * field_h == (u64)words * 2) {
+				avm_meas_mode.w = sig.w;
+				avm_meas_mode.h = field_h * 2;
+				avm_meas_mode.target = sig.w * field_h;
+				avm_meas_mode.name = "meas-i";
+				avm_meas_mode.interlaced = true;
+				return &avm_meas_mode;
+			}
+		} else {
+			u64 expected = (u64)sig.w * sig.h / 2;
+			u64 tol = expected / 50 + 64;
+
+			if (words + tol >= expected && words <= expected + tol) {
+				avm_meas_mode.w = sig.w;
+				avm_meas_mode.h = sig.h;
+				avm_meas_mode.target = expected;
+				avm_meas_mode.name = "meas-p";
+				avm_meas_mode.interlaced = false;
+				return &avm_meas_mode;
+			}
+		}
+	}
 
 	for (i = 0; i < ARRAY_SIZE(avm_modes); i++) {
 		const struct avm_mode *m = &avm_modes[i];
@@ -120,14 +184,43 @@ void avm_parser_reset(struct avm_device *dev)
 	p->active_w = 0;
 	p->active_h = 0;
 	p->mode_serial = 0;
+	/* a fresh stream must not instantly look "dead": mark now, so the
+	 * splash pump waits a full idle window before showing an overlay */
+	p->last_real_kt = ktime_get();
+	p->fps_t0 = 0;
+	p->fps_cnt = 0;
+	p->measured_fps = 0;
 	atomic_set(&p->valid_frames, 0);
 	atomic_set(&p->dropped_frames, 0);
 	atomic_set(&p->corrupt_frames, 0);
 	atomic_set(&p->resync_count, 0);
 }
 
+/*
+ * Rolling delivered-frame rate, for g_parm.  Counted at the delivery
+ * points only: interlaced fields arrive at twice the woven frame rate, so
+ * the counter must tick on the half-height pair, not on every field.
+ */
+static void avm_note_frame(struct avm_parser *p)
+{
+	p->fps_cnt++;
+	if (p->fps_t0 == 0) {
+		p->fps_t0 = ktime_get();
+	} else {
+		s64 el_ms = ktime_to_ms(ktime_sub(ktime_get(), p->fps_t0));
+
+		if (el_ms >= 1000) {
+			p->measured_fps = (p->fps_cnt * 1000) / el_ms;
+			if (p->measured_fps > 240)
+				p->measured_fps = 0; /* bogus: let it settle */
+			p->fps_cnt = 0;
+			p->fps_t0 = 0;
+		}
+	}
+}
+
 /* Deliver a completed frame into the oldest queued vb2 buffer (if any). */
-static void avm_deliver_frame(struct avm_device *dev, const u8 *src, u32 words)
+void avm_deliver_frame(struct avm_device *dev, const u8 *src, u32 words)
 {
 	struct avm_parser *p = &dev->parser;
 	struct avm_buffer *buf;
@@ -221,6 +314,7 @@ static void avm_weave_field(struct avm_device *dev, u32 field_words)
 	if (p->fields_woven == 0x03) {
 		p->fields_woven = 0;
 		/* keep only the (already interleaved) half-height pair */
+		avm_note_frame(p);
 		avm_deliver_frame(dev, p->weave, frame_words);
 	}
 }
@@ -234,18 +328,27 @@ static void avm_handle_frame_end(struct avm_device *dev, u32 frame_words)
 	struct avm_parser *p = &dev->parser;
 	const struct avm_mode *mode;
 	bool mode_w_changed = true;
+	/* The FPGA's own C0 scan-mode flag (b2 & 0x80) is the authoritative
+	 * interlace source; the status worker's STDI bit is the fallback. */
+	bool interlaced;
 
 	if (!frame_words) {
 		atomic_inc(&p->dropped_frames);
 		return;
 	}
 
-	mode = avm_detect_mode(frame_words);
+	interlaced = (p->field_flags & 0x80) != 0;
+	mode = avm_detect_mode(dev, frame_words, interlaced);
 	if (!mode) {
 		atomic_inc(&p->corrupt_frames);
 		atomic_inc(&p->dropped_frames);
 		return;
 	}
+
+	/* Real video data reached a recognizable frame: feed the liveness
+	 * stamp used by the splash pump (a dying input stops updating it,
+	 * transitional drops still count as live data). */
+	WRITE_ONCE(p->last_real_kt, ktime_get());
 
 	/* Mode switch hysteresis: 4 consecutive same-geometry frames. */
 	if (p->active_w == mode->w && p->active_h == mode->h) {
@@ -291,6 +394,7 @@ static void avm_handle_frame_end(struct avm_device *dev, u32 frame_words)
 		return;
 	}
 
+	avm_note_frame(p);
 	avm_deliver_frame(dev, p->frame, frame_words);
 }
 

@@ -40,6 +40,7 @@ static const struct avm_fsize avm_sizes[] = {
 	{ 1280,  720 },
 	{  720,  576 },
 	{  720,  480 },
+	{  640,  480 },
 };
 
 static const struct avm_fsize *avm_nearest_size(u32 w, u32 h)
@@ -91,13 +92,24 @@ static int avm_enum_fmt(struct file *file, void *fh,
 	return 0;
 }
 
-/* Current detected geometry (falls back to 1920x1080 before the first
- * frame locks, and after stop_streaming resets the parser). */
+/* Current detected geometry (falls back to the ADV7604 measurement before
+ * the first frame locks, then 1920x1080). */
 static void avm_pixfmt(struct avm_device *dev, struct v4l2_pix_format *pix)
 {
 	u32 w = READ_ONCE(dev->parser.active_w);
 	u32 h = READ_ONCE(dev->parser.active_h);
+	unsigned long flags;
 
+	if (!w || !h) {
+		spin_lock_irqsave(&dev->sig_lock, flags);
+		if (dev->sig.valid && dev->sig.tmds_locked &&
+		    dev->sig.w >= 320 && dev->sig.w <= 4095 &&
+		    dev->sig.h >= 120 && dev->sig.h <= 2048) {
+			w = dev->sig.w;
+			h = dev->sig.h;
+		}
+		spin_unlock_irqrestore(&dev->sig_lock, flags);
+	}
 	if (!w || !h) {
 		w = 1920;
 		h = 1080;
@@ -211,24 +223,49 @@ static int avm_enum_framesizes(struct file *file, void *fh,
 	return 0;
 }
 
+/* Nominal source rates the capture path can carry, 60 down to 15 fps -
+ * the same range the official driver offers.  The source itself paces the
+ * delivered cadence; g_parm reports the measured rate once known. */
+static const struct v4l2_fract avm_intervals[] = {
+	{ 1, 60 },	/* 60.00 */
+	{ 1, 50 },	/* 50.00 */
+	{ 1, 30 },	/* 29.97-ish, nominal 30 */
+	{ 1, 25 },	/* 25.00 */
+	{ 1, 24 },	/* 23.98-ish, nominal 24 */
+	{ 1, 15 },	/* 15.00 */
+};
+
 static int avm_enum_frameintervals(struct file *file, void *fh,
 				   struct v4l2_frmivalenum *fiv)
 {
-	if (fiv->index != 0)
+	if (fiv->index >= ARRAY_SIZE(avm_intervals))
 		return -EINVAL;
 	fiv->type = V4L2_FRMIVAL_TYPE_DISCRETE;
-	fiv->discrete.numerator = 1;
-	fiv->discrete.denominator = 30;
+	fiv->discrete = avm_intervals[fiv->index];
 	return 0;
+}
+
+/* Measured frame rate once the stream is locked, else the nominal 30. */
+static void avm_current_interval(struct avm_device *dev,
+				 struct v4l2_fract *tpf)
+{
+	u32 fps = READ_ONCE(dev->parser.measured_fps);
+
+	if (!fps || fps > 240)
+		fps = 30;
+	tpf->numerator = 1;
+	tpf->denominator = fps;
 }
 
 static int avm_g_parm(struct file *file, void *fh, struct v4l2_streamparm *p)
 {
+	struct avm_device *dev = video_drvdata(file);
+
 	if (p->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 		return -EINVAL;
 	p->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
-	p->parm.capture.timeperframe.numerator = 1;
-	p->parm.capture.timeperframe.denominator = 30;
+	p->parm.capture.readbuffers = 4;
+	avm_current_interval(dev, &p->parm.capture.timeperframe);
 	return 0;
 }
 

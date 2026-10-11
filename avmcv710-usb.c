@@ -201,6 +201,7 @@ static int avm_usb_probe(struct usb_interface *intf,
 	dev->udev = usb_get_dev(udev);
 	dev->intf = intf;
 	mutex_init(&dev->stream_lock);
+	mutex_init(&dev->ctrl_lock);
 	spin_lock_init(&dev->urbs_lock);
 	INIT_LIST_HEAD(&dev->drain_list);
 	INIT_LIST_HEAD(&dev->vb_bufs);
@@ -242,6 +243,10 @@ static int avm_usb_probe(struct usb_interface *intf,
 	if (ret)
 		goto err_wq;
 
+	/* Started in probe so g_fmt can report the live measurement and the
+	 * splash pump is armed even before the first STREAMON. */
+	avm_status_init(dev);
+
 	dev_info(&udev->dev,
 		 "AVerMedia ExtremeCap U3 (CV710) ready, %u x %u byte URBs\n",
 		 AVM_NUM_URBS, AVM_CHUNK_BYTES);
@@ -273,6 +278,10 @@ static void avm_usb_disconnect(struct usb_interface *intf)
 	 * workqueue destroy / URB free / device free must outlive any user
 	 * that is still holding the video node.
 	 */
+	/* The status worker speaks EP1: stop it before any teardown I2C
+	 * traffic so a status read can never race the pipe teardown. */
+	avm_status_shutdown(dev);
+
 	mutex_lock(&dev->stream_lock);
 	dev->streaming = false;
 	mutex_unlock(&dev->stream_lock);

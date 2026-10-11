@@ -17,8 +17,12 @@
 #include "avmcv710.h"
 #include "avmcv710-bootstrap.h"
 
-/* Bulk EP1 write.  len must be <= 512 (fits one max-packet TLP group). */
-int avm_ep1_write(struct avm_device *dev, const u8 *data, size_t len)
+/* Bulk EP1 primitives.  len must be <= 512 (fits one max-packet TLP
+ * group).  Bootstrap uses generous timeouts; live status reads use the
+ * same 500 ms the userspace driver does so a wedged control pipe cannot
+ * stall the poll worker for seconds. */
+static int avm_ep1_write_t(struct avm_device *dev, const u8 *data,
+			   size_t len, int timeout)
 {
 	int actual = 0;
 	int ret;
@@ -28,7 +32,7 @@ int avm_ep1_write(struct avm_device *dev, const u8 *data, size_t len)
 
 	ret = usb_bulk_msg(dev->udev,
 			   usb_sndbulkpipe(dev->udev, AVM_EP_CTRL_OUT),
-			   (void *)data, len, &actual, AVM_BOOT_WRITE_TIMEOUT);
+			   (void *)data, len, &actual, timeout);
 	if (ret < 0)
 		return ret;
 	if (actual != len)
@@ -36,14 +40,15 @@ int avm_ep1_write(struct avm_device *dev, const u8 *data, size_t len)
 	return 0;
 }
 
-int avm_ep1_read(struct avm_device *dev, u8 *data, size_t len)
+static int avm_ep1_read_t(struct avm_device *dev, u8 *data, size_t len,
+			  int timeout)
 {
 	int actual = 0;
 	int ret;
 
 	ret = usb_bulk_msg(dev->udev,
 			   usb_rcvbulkpipe(dev->udev, AVM_EP_CTRL_IN),
-			   data, len, &actual, AVM_BOOT_READ_TIMEOUT);
+			   data, len, &actual, timeout);
 	if (ret < 0)
 		return ret;
 	if (actual != len)
@@ -51,37 +56,55 @@ int avm_ep1_read(struct avm_device *dev, u8 *data, size_t len)
 	return 0;
 }
 
+int avm_ep1_write(struct avm_device *dev, const u8 *data, size_t len)
+{
+	return avm_ep1_write_t(dev, data, len, AVM_BOOT_WRITE_TIMEOUT);
+}
+
+int avm_ep1_read(struct avm_device *dev, u8 *data, size_t len)
+{
+	return avm_ep1_read_t(dev, data, len, AVM_BOOT_READ_TIMEOUT);
+}
+
+/* Status-path EP1 transactions (500 ms, like the userspace driver). */
+#define AVM_STATUS_IO_TIMEOUT	500
+
 /*
- * I2C bridge: 5-byte write command "01 <slave7> 01 <reg> <val>".
- * Used for the mode-independent FPGA work/idle toggle and any manual
- * VID_STD or input tweaks.  Control traffic is serialized by the caller
- * (probe path is single-threaded; the streaming path never calls these).
+ * I2C bridge (matches UsbStream::sendI2cWrite/sendI2cRead exactly):
+ *   write: 5-byte "01 <slave7> 01 <reg> <val>"
+ *   read:  5-byte "02 <slave7> 01 <len> <reg>", then <len> bytes on EP1 IN.
+ * Every command+response pair is atomic under dev->ctrl_lock so the status
+ * worker can poll the ADV7604 while start/stop toggles the FPGA mode
+ * without two transactions interleaving (a response stolen by the other
+ * thread would be garbage, exactly the class of CV-03 bug the userspace
+ * driver serializes against).
  */
 int avm_i2c_write(struct avm_device *dev, u8 slave7, u8 reg, u8 val)
 {
 	u8 cmd[5] = { 0x01, slave7, 0x01, reg, val };
-
-	return avm_ep1_write(dev, cmd, sizeof(cmd));
-}
-
-int avm_i2c_read(struct avm_device *dev, u8 slave7, u8 reg, u8 *val)
-{
-	u8 cmd[5] = { 0x01, slave7, 0x01, reg, 0x00 };
-	u8 buf[4] = { 0 };
 	int ret;
 
-	/*
-	 * The read round-trip is "write the 4-byte register probe, then
-	 * read the response".  The driver's read helper sends the 5-byte
-	 * write with a dummy value byte; the bridge answers on EP1 IN.
-	 */
-	ret = avm_ep1_write(dev, cmd, 5);
-	if (ret)
-		return ret;
+	mutex_lock(&dev->ctrl_lock);
+	ret = avm_ep1_write_t(dev, cmd, sizeof(cmd), AVM_STATUS_IO_TIMEOUT);
+	mutex_unlock(&dev->ctrl_lock);
+	return ret;
+}
 
-	/* Probe may be a no-op; even a 0-length answer keeps EP1 sane. */
-	(void)buf;
-	return 0;
+int avm_i2c_read_block(struct avm_device *dev, u8 slave7, u8 reg,
+		       u8 *data, u8 len)
+{
+	u8 cmd[5] = { 0x02, slave7, 0x01, len, reg };
+	int ret;
+
+	if (WARN_ON_ONCE(len == 0 || len > 32))
+		return -EINVAL;
+
+	mutex_lock(&dev->ctrl_lock);
+	ret = avm_ep1_write_t(dev, cmd, sizeof(cmd), AVM_STATUS_IO_TIMEOUT);
+	if (!ret)
+		ret = avm_ep1_read_t(dev, data, len, AVM_STATUS_IO_TIMEOUT);
+	mutex_unlock(&dev->ctrl_lock);
+	return ret;
 }
 
 /*
@@ -93,7 +116,7 @@ int avm_fpga_work_mode(struct avm_device *dev, bool work)
 {
 	u8 mode = 0;
 
-	avm_i2c_read(dev, 0x10, 0x05, &mode);
+	avm_i2c_read_block(dev, 0x10, 0x05, &mode, 1);
 	if (work)
 		mode |= 0x02;
 	else
@@ -104,13 +127,18 @@ int avm_fpga_work_mode(struct avm_device *dev, bool work)
 /*
  * Single byte 0x14 on EP1 OUT: resets the FX3 stream DMA, clearing any
  * internal FIFO pointers before streaming begins.  Mirrors
- * Fx3Firmware::resetStreamDMA.
+ * Fx3Firmware::resetStreamDMA.  Serialized under ctrl_lock with the
+ * other control traffic.
  */
 int avm_reset_stream_dma(struct avm_device *dev)
 {
 	u8 cmd = 0x14;
+	int ret;
 
-	return avm_ep1_write(dev, &cmd, 1);
+	mutex_lock(&dev->ctrl_lock);
+	ret = avm_ep1_write(dev, &cmd, 1);
+	mutex_unlock(&dev->ctrl_lock);
+	return ret;
 }
 
 /*

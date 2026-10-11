@@ -24,6 +24,7 @@
 #define AVM_CV710_H
 
 #include <linux/kernel.h>
+#include <linux/ktime.h>
 #include <linux/mutex.h>
 #include <linux/spinlock.h>
 #include <linux/types.h>
@@ -58,8 +59,9 @@
 #define AVM_MARKER_AUDIO	0x58FFFF00u	/* audio packet start */
 #define AVM_MARKER_AUDIO_PAD	0xAA5555AAu	/* audio pad / DMA align */
 
-/* Streaming pipeline */
-#define AVM_NUM_URBS		4
+/* Streaming pipeline (the userspace driver runs 7 concurrent transfers;
+ * 6 keeps the same slack without pre-buffering a full frame more) */
+#define AVM_NUM_URBS		6
 /* Bootstrap control timeouts */
 #define AVM_BOOT_WRITE_TIMEOUT	2000
 #define AVM_BOOT_READ_TIMEOUT	2000
@@ -111,11 +113,37 @@ struct avm_parser {
 	u32 target_words;	/* words expected for active mode */
 	unsigned int mode_serial; /* bumped on each locked switch */
 
+	/* liveness / pacing: last time real frame data was seen, and the
+	 * rolling frame rate (used to pace the no-signal/out-of-range
+	 * splash and to answer g/s_parm) */
+	ktime_t last_real_kt;
+	ktime_t fps_t0;
+	u32 fps_cnt;
+	u32 measured_fps;
+
 	/* stats (atomic-visible counters) */
 	atomic_t valid_frames;
 	atomic_t dropped_frames;
 	atomic_t corrupt_frames;
 	atomic_t resync_count;
+};
+
+/* ADV7604 status snapshot, published by the status worker (~10 Hz). */
+struct avm_signal {
+	bool valid;		/* at least one successful poll published */
+	bool tmds_locked;	/* IO 0x6a: (v & 0xE0) == 0xE0 && (v & 0x10) */
+	bool interlaced;	/* IO 0x12 STDI bit 4 */
+	u32 w, h;		/* measured active geometry (12-bit, 0 = n/a) */
+	u32 poll_failures;	/* consecutive failed polls */
+};
+
+/* Overlay bitmap shown when the input is unavailable / unusable. */
+enum avm_splash {
+	AVM_SPLASH_NONE = 0,
+	AVM_SPLASH_NO_SIGNAL,
+	AVM_SPLASH_OUT_OF_RANGE,
+	AVM_SPLASH_HDCP,
+	AVM_SPLASH_CONTENT_PROTECTION,
 };
 
 struct avm_buffer {
@@ -133,6 +161,10 @@ struct avm_device {
 
 	struct v4l2_pix_format fmt;	/* current negotiated format */
 
+	/* serializes EP1 control traffic (I2C reads/writes are
+	 * command+response pairs and must stay atomic) */
+	struct mutex ctrl_lock;
+
 	/* streaming */
 	bool streaming;			/* protected by stream_lock */
 	struct mutex stream_lock;
@@ -145,6 +177,13 @@ struct avm_device {
 	unsigned int pending_bufs;
 	struct avm_parser parser;
 
+	/* ADV7604 status poll + splash pump (delayed work, ~30 Hz) */
+	spinlock_t sig_lock;		/* protects dev->sig */
+	struct avm_signal sig;
+	enum avm_splash splash;		/* currently shown overlay */
+	u32 status_tick;
+	struct delayed_work status_work;
+
 	/* USB plumbing */
 	struct usb_anchor urb_anchor;	/* anchored streaming URBs */
 	bool bootstrapped;
@@ -155,7 +194,8 @@ int avm_bootstrap(struct avm_device *dev);
 int avm_ep1_write(struct avm_device *dev, const u8 *data, size_t len);
 int avm_ep1_read(struct avm_device *dev, u8 *data, size_t len);
 int avm_i2c_write(struct avm_device *dev, u8 slave7, u8 reg, u8 val);
-int avm_i2c_read(struct avm_device *dev, u8 slave7, u8 reg, u8 *val);
+int avm_i2c_read_block(struct avm_device *dev, u8 slave7, u8 reg,
+		       u8 *data, u8 len);
 int avm_fpga_work_mode(struct avm_device *dev, bool work);
 int avm_reset_stream_dma(struct avm_device *dev);
 
@@ -166,8 +206,14 @@ int avm_video_register(struct avm_device *dev);
 void avm_return_buffers(struct avm_device *dev);
 void avm_usb_release(struct avm_device *dev);
 
+/* avmcv710-status.c */
+void avm_status_init(struct avm_device *dev);
+void avm_status_shutdown(struct avm_device *dev);
+
 /* avmcv710-parser.c */
 void avm_parser_reset(struct avm_device *dev);
 void avm_parser_feed(struct avm_device *dev, u32 *d, u32 count);
+void avm_deliver_frame(struct avm_device *dev, const u8 *src, u32 words);
+const u8 *avm_splash_bmp(enum avm_splash kind, u32 *words);
 
 #endif /* AVM_CV710_H */

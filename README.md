@@ -128,6 +128,10 @@ and S_PARM cannot retime it. The converter never scales geometry.
 
 ## Driver internals / file map
 
+A running development log with the official-driver parity matrix, the
+reverse-engineering ledger and the prioritized TODO list lives in
+[`docs/DEVLOG.md`](docs/DEVLOG.md).
+
 | File | Role |
 | --- | --- |
 | `avmcv710.h` | device/parser/buffer structs, constants, cross-file API |

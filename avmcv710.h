@@ -59,9 +59,11 @@
 #define AVM_MARKER_AUDIO	0x58FFFF00u	/* audio packet start */
 #define AVM_MARKER_AUDIO_PAD	0xAA5555AAu	/* audio pad / DMA align */
 
-/* Streaming pipeline (the userspace driver runs 7 concurrent transfers;
- * 6 keeps the same slack without pre-buffering a full frame more) */
-#define AVM_NUM_URBS		6
+/* Streaming pipeline.  Latency = (urbs - 1) chunks of pre-buffering: each
+ * chunk is 2 MB, so 4 URBs hold ~1 frame of slack at 1080p60 (~33 ms) while
+ * still covering USB scheduling jitter.  6+ URBs pre-buffered ~2 frames and
+ * showed up as visible latency in OBS. */
+#define AVM_NUM_URBS		4
 /* Bootstrap control timeouts */
 #define AVM_BOOT_WRITE_TIMEOUT	2000
 #define AVM_BOOT_READ_TIMEOUT	2000
@@ -114,6 +116,7 @@ struct avm_parser {
 	u32 active_w, active_h;
 	u32 target_words;	/* words expected for active mode */
 	unsigned int mode_serial; /* bumped on each locked switch */
+	u32 frame_sequence;	/* DQBUF sequence counter (V4L2_BUF.sequence) */
 
 	/* liveness / pacing: last time real frame data was seen, and the
 	 * rolling frame rate (used to pace the no-signal/out-of-range

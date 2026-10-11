@@ -110,6 +110,21 @@ static void avm_pixfmt(struct avm_device *dev, struct v4l2_pix_format *pix)
 	pix->bytesperline = w * 2;
 	pix->sizeimage = w * h * 2;
 	pix->colorspace = V4L2_COLORSPACE_SMPTE170M;
+	/*
+	 * Declare the colorimetry the FPGA passes through.  HDMI YCbCr is
+	 * limited range; BT.601 for SD, BT.709 for HD.  Consumers (OBS) use
+	 * this for their conversion; leaving it all zero (DEFAULT) offered no
+	 * hint and produced washed-out/clipped colour.
+	 */
+	pix->quantization = V4L2_QUANTIZATION_LIM_RANGE;
+	if (h > 576) {
+		pix->colorspace = V4L2_COLORSPACE_REC709;
+		pix->ycbcr_enc = V4L2_YCBCR_ENC_709;
+		pix->xfer_func = V4L2_XFER_FUNC_709;
+	} else {
+		pix->ycbcr_enc = V4L2_YCBCR_ENC_601;
+		pix->xfer_func = V4L2_XFER_FUNC_DEFAULT;
+	}
 	pix->priv = 0;
 }
 
@@ -549,7 +564,10 @@ int avm_video_register(struct avm_device *dev)
 	dev->fmt.field = V4L2_FIELD_NONE;
 	dev->fmt.bytesperline = 3840;
 	dev->fmt.sizeimage = 1920 * 1080 * 2;
-	dev->fmt.colorspace = V4L2_COLORSPACE_SMPTE170M;
+	dev->fmt.colorspace = V4L2_COLORSPACE_REC709;
+	dev->fmt.ycbcr_enc = V4L2_YCBCR_ENC_709;
+	dev->fmt.quantization = V4L2_QUANTIZATION_LIM_RANGE;
+	dev->fmt.xfer_func = V4L2_XFER_FUNC_709;
 
 	ret = v4l2_device_register(&dev->udev->dev, v4l2_dev);
 	if (ret) {

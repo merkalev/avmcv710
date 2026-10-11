@@ -238,6 +238,7 @@ void avm_parser_reset(struct avm_device *dev)
 	p->active_w = 0;
 	p->active_h = 0;
 	p->mode_serial = 0;
+	p->frame_sequence = 0;
 	/* a fresh stream must not instantly look "dead": mark now, so the
 	 * splash pump waits a full idle window before showing an overlay */
 	p->last_real_kt = ktime_get();
@@ -310,6 +311,14 @@ void avm_deliver_frame(struct avm_device *dev, const u8 *src, u32 words)
 
 	memcpy(dst, src, words * 4);
 	vb2_set_plane_payload(&buf->vb.vb2_buf, 0, words * 4);
+	/*
+	 * The driver owns the timestamp and sequence for a capture queue with
+	 * V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC; vb2 does not fill them.  Leaving
+	 * them zero makes a consumer that paces/syncs on the buffer timestamp
+	 * (OBS) accumulate latency, so stamp every delivered frame.
+	 */
+	buf->vb.vb2_buf.timestamp = ktime_get_ns();
+	buf->vb.sequence = p->frame_sequence++;
 	vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
 	atomic_inc(&p->valid_frames);
 }

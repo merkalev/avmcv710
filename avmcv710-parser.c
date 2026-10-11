@@ -264,10 +264,26 @@ static void avm_note_frame(struct avm_parser *p)
 	} else {
 		s64 el_ms = ktime_to_ms(ktime_sub(ktime_get(), p->fps_t0));
 
-		if (el_ms >= 1000) {
-			p->measured_fps = (p->fps_cnt * 1000) / el_ms;
-			if (p->measured_fps > 240)
-				p->measured_fps = 0; /* bogus: let it settle */
+		/*
+		 * Rate over a ~2.5 s window, with two corrections that stop a
+		 * 60 Hz source from reporting 61:
+		 *  - the window spans (fps_cnt - 1) frame periods: the first
+		 *    counted frame only started the clock, it did not end one.
+		 *    Plainly dividing fps_cnt gave 61 frames / 1000 ms = 61.
+		 *  - round to nearest instead of flooring.
+		 * OBS displays the G_PARM / enumerated interval, so a steady
+		 * 60 Hz source must show 60, not 60.x.
+		 */
+		if (el_ms >= 2500 && p->fps_cnt > 1) {
+			u32 fps = ((p->fps_cnt - 1) * 1000 + el_ms / 2) / el_ms;
+			u32 cur = p->measured_fps;
+
+			if (fps > 240)
+				fps = 0; /* bogus: let it settle */
+			/* Drop a single-count flap (window phase noise on a
+			 * steady source); a real change is always >= 2. */
+			if (!cur || fps > cur + 1 || fps + 1 < cur)
+				p->measured_fps = fps;
 			p->fps_cnt = 0;
 			p->fps_t0 = 0;
 			/* A fresh rate snapshot may let the CVX8897 converter

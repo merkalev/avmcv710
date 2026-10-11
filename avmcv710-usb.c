@@ -365,7 +365,7 @@ static int avm_usb_probe(struct usb_interface *intf,
 	dev_info(&udev->dev,
 		 "AVerMedia ExtremeCap U3 (CV710) ready, %u x %u byte URBs\n",
 		 AVM_NUM_URBS, AVM_CHUNK_BYTES);
-	queue_delayed_work(system_wq, &dev->watch_work, 5 * HZ);
+	queue_delayed_work(system_dfl_wq, &dev->watch_work, 5 * HZ);
 	return 0;
 
 err_wq:
@@ -415,7 +415,8 @@ static void avm_watchdog(struct work_struct *work)
 		}
 	}
 	dev->watch_last_chunks = chunks;
-	queue_delayed_work(system_wq, &dev->watch_work, 5 * HZ);
+	/* system_wq is deprecated; system_dfl_wq is the unbound default. */
+	queue_delayed_work(system_dfl_wq, &dev->watch_work, 5 * HZ);
 }
 
 static void avm_usb_disconnect(struct usb_interface *intf)

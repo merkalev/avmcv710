@@ -28,21 +28,13 @@ static inline struct avm_buffer *to_avm_buffer(struct vb2_buffer *vb)
 
 /*
  * Source-paced capture: the geometry (and frame rate) is whatever the HDMI
- * source locks.  A requested size can never be honoured, so every format
- * ioctl reports the live geometry (see avm_pixfmt()); these standard sink
- * geometries are offered by enum_framesizes() as additional menu entries.
+ * source locks.  The FPGA passes the raster through and cannot scale on its
+ * own - the vendor's multi-resolution menu is really the CVX8897 converter,
+ * which this driver does not program - so a requested size can never be
+ * honoured and every format ioctl reports the live geometry (avm_pixfmt()).
+ * enum_framesizes()/enum_frameintervals() advertise that live value only,
+ * instead of a menu of entries that would silently come back as the source.
  */
-struct avm_fsize {
-	u32 w, h;
-};
-
-static const struct avm_fsize avm_sizes[] = {
-	{ 1920, 1080 },
-	{ 1280,  720 },
-	{  720,  576 },
-	{  720,  480 },
-	{  640,  480 },
-};
 
 /* ------------------------------------------------------------------ */
 /* v4l2 ioctls                                                         */
@@ -204,60 +196,24 @@ static int avm_enum_framesizes(struct file *file, void *fh,
 {
 	struct avm_device *dev = video_drvdata(file);
 	struct v4l2_pix_format pix;
-	unsigned int i, extra = 0;
 
 	if (fsize->pixel_format != V4L2_PIX_FMT_YUYV)
 		return -EINVAL;
-
 	/*
-	 * The live source geometry is entry 0 (it may be a non-table size such
-	 * as 1366x768); the standard sink geometries follow, with a duplicate
-	 * skipped when the live size already is one of them.
+	 * Exactly one size exists: the live source geometry (which may be a
+	 * non-standard raster such as 1366x768).  Advertising 1280x720 or
+	 * 640x480 as selectable told consumers those modes existed, but the
+	 * raster is passed through unscaled and the request was silently
+	 * ignored.  A change of source geometry is announced through
+	 * V4L2_EVENT_SOURCE_CHANGE, when the consumer re-queries this.
 	 */
+	if (fsize->index > 0)
+		return -EINVAL;
+
 	avm_pixfmt(dev, &pix);
-	for (i = 0; i < ARRAY_SIZE(avm_sizes); i++) {
-		if (avm_sizes[i].w == pix.width &&
-		    avm_sizes[i].h == pix.height)
-			break;
-	}
-	if (i == ARRAY_SIZE(avm_sizes))
-		extra = 1;
-
-	if (fsize->index < extra) {
-		fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
-		fsize->discrete.width = pix.width;
-		fsize->discrete.height = pix.height;
-		return 0;
-	}
-	i = fsize->index - extra;
-	if (i >= ARRAY_SIZE(avm_sizes))
-		return -EINVAL;
-
 	fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
-	fsize->discrete.width = avm_sizes[i].w;
-	fsize->discrete.height = avm_sizes[i].h;
-	return 0;
-}
-
-/* Nominal source rates the capture path can carry, 60 down to 15 fps -
- * the same range the official driver offers.  The source itself paces the
- * delivered cadence; g_parm reports the measured rate once known. */
-static const struct v4l2_fract avm_intervals[] = {
-	{ 1, 60 },	/* 60.00 */
-	{ 1, 50 },	/* 50.00 */
-	{ 1, 30 },	/* 29.97-ish, nominal 30 */
-	{ 1, 25 },	/* 25.00 */
-	{ 1, 24 },	/* 23.98-ish, nominal 24 */
-	{ 1, 15 },	/* 15.00 */
-};
-
-static int avm_enum_frameintervals(struct file *file, void *fh,
-				   struct v4l2_frmivalenum *fiv)
-{
-	if (fiv->index >= ARRAY_SIZE(avm_intervals))
-		return -EINVAL;
-	fiv->type = V4L2_FRMIVAL_TYPE_DISCRETE;
-	fiv->discrete = avm_intervals[fiv->index];
+	fsize->discrete.width = pix.width;
+	fsize->discrete.height = pix.height;
 	return 0;
 }
 
@@ -271,6 +227,26 @@ static void avm_current_interval(struct avm_device *dev,
 		fps = 30;
 	tpf->numerator = 1;
 	tpf->denominator = fps;
+}
+
+static int avm_enum_frameintervals(struct file *file, void *fh,
+				   struct v4l2_frmivalenum *fiv)
+{
+	struct avm_device *dev = video_drvdata(file);
+
+	if (fiv->pixel_format != V4L2_PIX_FMT_YUYV)
+		return -EINVAL;
+	/*
+	 * Same reasoning as enum_framesizes(): the source paces the cadence
+	 * and S_PARM cannot retime it, so only the measured rate is real.  The
+	 * old 60/50/30/25/24/15 menu looked selectable but did nothing.
+	 */
+	if (fiv->index > 0)
+		return -EINVAL;
+
+	fiv->type = V4L2_FRMIVAL_TYPE_DISCRETE;
+	avm_current_interval(dev, &fiv->discrete);
+	return 0;
 }
 
 static int avm_g_parm(struct file *file, void *fh, struct v4l2_streamparm *p)

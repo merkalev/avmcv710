@@ -24,6 +24,43 @@ static inline struct avm_buffer *to_avm_buffer(struct vb2_buffer *vb)
 	return container_of(to_vb2_v4l2_buffer(vb), struct avm_buffer, vb);
 }
 
+/*
+ * Source-paced capture: the geometry (and frame rate) is whatever the HDMI
+ * source locks.  Only these four geometries are supported; expose exactly
+ * them and snap any TRY_FMT to the nearest one so a consumer cannot force a
+ * size the device cannot produce (forcing one only makes the device show
+ * its internal OUT-OF-RANGE bitmap and the parser drops those frames).
+ */
+struct avm_fsize {
+	u32 w, h;
+};
+
+static const struct avm_fsize avm_sizes[] = {
+	{ 1920, 1080 },
+	{ 1280,  720 },
+	{  720,  576 },
+	{  720,  480 },
+};
+
+static const struct avm_fsize *avm_nearest_size(u32 w, u32 h)
+{
+	const struct avm_fsize *best = &avm_sizes[0];
+	u64 best_d = U64_MAX;
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(avm_sizes); i++) {
+		long dw = (long)avm_sizes[i].w - w;
+		long dh = (long)avm_sizes[i].h - h;
+		u64 d = (u64)(dw * dw) + (u64)(dh * dh);
+
+		if (d < best_d) {
+			best_d = d;
+			best = &avm_sizes[i];
+		}
+	}
+	return best;
+}
+
 /* ------------------------------------------------------------------ */
 /* v4l2 ioctls                                                         */
 
@@ -100,17 +137,18 @@ static int avm_try_fmt(struct file *file, void *fh, struct v4l2_format *f)
 		return 0;
 	}
 
-	/* Accept caller sizes within the palette; planes are always max. */
+	/* Accept only the supported geometries; snap to the nearest one. */
 	if (pix->width == 0 || pix->height == 0) {
 		avm_pixfmt(dev, pix);
 		return 0;
 	}
-	if (pix->width > 1920)
-		pix->width = 1920;
-	if (pix->height > 1080)
-		pix->height = 1080;
-	pix->width &= ~1u;
-	pix->height &= ~1u;
+	{
+		const struct avm_fsize *f = avm_nearest_size(pix->width,
+							     pix->height);
+
+		pix->width = f->w;
+		pix->height = f->h;
+	}
 	pix->field = V4L2_FIELD_NONE;
 	pix->bytesperline = pix->width * 2;
 	pix->sizeimage = pix->width * pix->height * 2;
@@ -159,31 +197,17 @@ static int avm_s_input(struct file *file, void *fh, unsigned int index)
 	return index == 0 ? 0 : -EINVAL;
 }
 
-/*
- * Source-paced capture: the geometry (and frame rate) is whatever the HDMI
- * source locks, so the only honest enumeration is the currently detected
- * size / the nominal 30fps capture interval.
- */
 static int avm_enum_framesizes(struct file *file, void *fh,
 			       struct v4l2_frmsizeenum *fsize)
 {
-	struct avm_device *dev = video_drvdata(file);
-	u32 w, h;
-
-	if (fsize->index != 0)
+	if (fsize->index >= ARRAY_SIZE(avm_sizes))
 		return -EINVAL;
 	if (fsize->pixel_format != V4L2_PIX_FMT_YUYV)
 		return -EINVAL;
 
-	w = READ_ONCE(dev->parser.active_w);
-	h = READ_ONCE(dev->parser.active_h);
-	if (!w || !h) {
-		w = 1920;
-		h = 1080;
-	}
 	fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
-	fsize->discrete.width = w;
-	fsize->discrete.height = h;
+	fsize->discrete.width = avm_sizes[fsize->index].w;
+	fsize->discrete.height = avm_sizes[fsize->index].h;
 	return 0;
 }
 
@@ -280,7 +304,7 @@ static void avm_buf_queue(struct vb2_buffer *vb)
 static int avm_start_streaming(struct vb2_queue *q, unsigned int count)
 {
 	struct avm_device *dev = vb2_get_drv_priv(q);
-	int ret, i;
+	int ret, i = 0;
 
 	/* vb2 core holds q->lock (== stream_lock) while calling this. */
 	if (dev->streaming)
@@ -319,6 +343,8 @@ static int avm_start_streaming(struct vb2_queue *q, unsigned int count)
 	return 0;
 
 err:
+	dev_err(&dev->udev->dev, "start_streaming failed: %d (URB %d)\n",
+		ret, i);
 	/* Symmetric with stop_streaming: no URBs may outlive this fail. */
 	WRITE_ONCE(dev->streaming, false);
 	usb_kill_anchored_urbs(&dev->urb_anchor);
@@ -331,13 +357,30 @@ err:
 static void avm_stop_streaming(struct vb2_queue *q)
 {
 	struct avm_device *dev = vb2_get_drv_priv(q);
+	unsigned long flags;
 
 	/* vb2 core holds q->lock (== stream_lock) while calling this. */
-	dev->streaming = false;
+	WRITE_ONCE(dev->streaming, false);
 
 	/* Kill in-flight URBs, then wait for parser work to finish. */
 	usb_kill_anchored_urbs(&dev->urb_anchor);
 	flush_workqueue(dev->wq);
+
+	/*
+	 * A worker that passed the streaming check just before the kill can
+	 * have re-anchored + resubmitted an URB while usb_kill_anchored_urbs
+	 * was draining the anchor, so it escaped the kill.  flush_workqueue
+	 * guarantees no further resubmits are possible now, so kill once
+	 * more to disarm any straggler - otherwise the next STREAMON would
+	 * fail with "URB already submitted" and the stream never starts
+	 * again (OBS shows a frozen device after a format/resolution switch).
+	 */
+	usb_kill_anchored_urbs(&dev->urb_anchor);
+
+	/* Drop any chunks the worker queued after the last splice. */
+	spin_lock_irqsave(&dev->urbs_lock, flags);
+	INIT_LIST_HEAD(&dev->drain_list);
+	spin_unlock_irqrestore(&dev->urbs_lock, flags);
 
 	avm_return_buffers(dev);
 

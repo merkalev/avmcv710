@@ -59,7 +59,7 @@
 #define AVM_MARKER_AUDIO_PAD	0xAA5555AAu	/* audio pad / DMA align */
 
 /* Streaming pipeline */
-#define AVM_NUM_URBS		6
+#define AVM_NUM_URBS		4
 /* Bootstrap control timeouts */
 #define AVM_BOOT_WRITE_TIMEOUT	2000
 #define AVM_BOOT_READ_TIMEOUT	2000

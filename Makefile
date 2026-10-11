@@ -9,7 +9,7 @@
 #   make -C /lib/modules/$(uname -r)/build M=$(pwd) modules
 #   (BSD make will not work; this requires GNU make.)
 
-avmcv710-y := avmcv710-hw.o avmcv710-parser.o avmcv710-usb.o avmcv710-video.o
+avmcv710-y := avmcv710-hw.o avmcv710-parser.o avmcv710-usb.o avmcv710-video.o avmcv710-cvx8897.o
 
 # In-tree: built according to Kconfig.  Out-of-tree (no CONFIG symbol):
 # build as a standalone module.

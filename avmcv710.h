@@ -194,6 +194,12 @@ int avm_i2c_read_block(struct avm_device *dev, u8 slave7, u8 reg,
 int avm_fpga_work_mode(struct avm_device *dev, bool work);
 int avm_reset_stream_dma(struct avm_device *dev);
 
+/* avmcv710-cvx8897.c */
+const u8 *avm_cvx8897_half_rate(u32 w, u32 h, u32 fps, bool rgb,
+				bool interlaced);
+int avm_cvx8897_apply(struct avm_device *dev, const u8 *values);
+int avm_cvx8897_set_mode(struct avm_device *dev, bool converted);
+
 /* avmcv710-video.c */
 int avm_video_register(struct avm_device *dev);
 void avm_source_change(struct avm_device *dev);

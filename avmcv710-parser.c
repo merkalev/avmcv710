@@ -48,6 +48,19 @@ static const struct avm_mode avm_modes[] = {
 static struct avm_mode avm_meas_mode;
 
 /*
+ * The distinctive per-field word counts of the standard interlaced modes:
+ * 1080i ~518,400, 576i ~103,680, 480i ~86,400 words.  Used both as a
+ * tie-breaker when the scan-mode flags are unclear and to protect a genuine
+ * field from the CV-28k progressive re-classification below.
+ */
+static bool avm_looks_interlaced_words(u32 n)
+{
+	return (n >= 510000 && n <= 524000) ||
+	       (n >=  98000 && n <= 110000) ||
+	       (n >=  80000 && n <=  92000);
+}
+
+/*
  * Map an observed frame/field word count to a mode.
  *
  * 1. Adaptive path first: when the ADV7604 status worker has locked TMDS
@@ -84,11 +97,26 @@ static const struct avm_mode *avm_detect_mode(struct avm_device *dev,
 		 * interlaced modes still identify a field stream - otherwise
 		 * a 1080i field would be misclassified as a 1920x540
 		 * progressive frame (same guard as the userspace driver). */
-		if (!interlaced &&
-		    ((words >= 510000 && words <= 524000) ||
-		     (words >=  98000 && words <= 110000) ||
-		     (words >=  80000 && words <=  92000)))
+		if (!interlaced && avm_looks_interlaced_words(words)) {
 			interlaced = true;
+		} else if (interlaced && !sig.interlaced &&
+			   !avm_looks_interlaced_words(words) &&
+			   sig.w > 0 && sig.h > 0) {
+			/* CV-28k: some SD firmware sets the C0 interlace bit
+			 * spuriously for progressive 480p/576p (and flaps
+			 * it), which would otherwise weave them into
+			 * double-height 720x960 / 720x1152 pictures.  If the
+			 * receiver is locked and measures a progressive
+			 * raster whose word count matches exactly what the
+			 * FPGA is sending, trust the receiver.  The guard
+			 * above keeps genuine 1080i/576i/480i fields
+			 * interlaced. */
+			u64 expected = (u64)sig.w * sig.h / 2;
+			u64 tol = expected / 50 + 64;
+
+			if (words + tol >= expected && words <= expected + tol)
+				interlaced = false;
+		}
 
 		if (interlaced) {
 			u32 field_h = (words * 2) / sig.w;
@@ -98,10 +126,36 @@ static const struct avm_mode *avm_detect_mode(struct avm_device *dev,
 			    (u64)sig.w * field_h == (u64)words * 2) {
 				avm_meas_mode.w = sig.w;
 				avm_meas_mode.h = field_h * 2;
-				avm_meas_mode.target = sig.w * field_h;
+				/* target is the FIELD word count: it must
+				 * match the incoming C1 count and the
+				 * standard-mode table entries, and it is
+				 * what avm_handle_frame_end() gates on.
+				 * The full woven frame is built separately
+				 * by avm_weave_field(). */
+				avm_meas_mode.target = sig.w * field_h / 2;
 				avm_meas_mode.name = "meas-i";
 				avm_meas_mode.interlaced = true;
 				return &avm_meas_mode;
+			}
+
+			/* Derivation failed (non-exact timing): trust the
+			 * receiver's geometry, converted to field words -
+			 * same fallback as the userspace driver. */
+			if (sig.h > 0) {
+				u32 frame_h = (sig.h <= 700) ? sig.h * 2
+							     : sig.h;
+				u64 expected = (u64)sig.w * frame_h / 4;
+				u64 tol = expected / 50 + 64;
+
+				if (words + tol >= expected &&
+				    words <= expected + tol) {
+					avm_meas_mode.w = sig.w;
+					avm_meas_mode.h = frame_h;
+					avm_meas_mode.target = expected;
+					avm_meas_mode.name = "meas-i";
+					avm_meas_mode.interlaced = true;
+					return &avm_meas_mode;
+				}
 			}
 		} else {
 			u64 expected = (u64)sig.w * sig.h / 2;
@@ -277,6 +331,18 @@ static void avm_weave_field(struct avm_device *dev, u32 field_words)
 
 	if (!p->active_w || field_words > stride_words * field_lines)
 		return; /* corrupt field; CV-23: drop, never blend shifted rows */
+
+	/*
+	 * K3: the woven frame is twice the field size, and every row is
+	 * written below *before* avm_deliver_frame() gets to validate the
+	 * size - so the bound must be enforced here or an exotic adaptive
+	 * interlaced geometry can overrun p->weave (AVM_FRAME_BPF).
+	 */
+	if (frame_words > AVM_MAX_FRAME_WORDS) {
+		atomic_inc(&p->corrupt_frames);
+		atomic_inc(&p->dropped_frames);
+		return; /* CV-23: drop, never overrun */
+	}
 
 	/* Determine parity: trust the device flag once it has alternated. */
 	if (p->last_device_parity >= 0 &&

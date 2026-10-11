@@ -22,7 +22,13 @@ port is written so that no userspace-visible condition can panic the kernel:
   length.
 - **Exact-size frame gate.** A frame is delivered only if its word count
   exactly matches the locked mode geometry (CV-23).  A mismatched frame is
-  dropped, never padded, repaired or partially copied.
+  dropped, never padded, repaired or partially copied.  For interlaced modes
+  the gate compares against the *field* word count (the incoming C1 count),
+  exactly as the userspace driver does.
+- **Woven-frame size bound.** Interlaced fields are woven only after the
+  full-frame word count is checked against `AVM_MAX_FRAME_WORDS`, and every
+  woven row is written inside `p->weave`; an exotic adaptive interlaced
+  geometry is dropped, never overrun.
 - **Drop, never repair.** Invalid C0/C1 headers, FPGA clock-recovering
   trailers, and mode-transition frames are counted and discarded; the parser
   resynchronises on the next valid C0.
@@ -47,6 +53,11 @@ port is written so that no userspace-visible condition can panic the kernel:
   overflow the buffer.
 - Interlaced 1080i / 576i / 480i fields detected from word counts and woven
   into full frames (device parity flag used once observed to alternate).
+  The CV-28k re-classification is ported: when the FPGA's C0 interlace bit is
+  set spuriously for progressive 480p/576p (and flaps), and the ADV7604
+  measures a matching progressive raster whose word count is not a genuine
+  field count, the receiver wins and the frame is presented at full height
+  instead of being woven to double height.
 - Mode-switch hysteresis: the active geometry only changes after 4
   consecutive frames of the new size; every transitional frame is dropped.
 - Fast bootstrap: 871 commands (841 writes / 30 reads) replayed over EP1 bulk

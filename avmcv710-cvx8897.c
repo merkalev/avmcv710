@@ -226,6 +226,12 @@ static void avm_cvx_work(struct work_struct *work)
 		    req * 2 >= in_fps - in_fps / 8 &&
 		    req * 2 <= in_fps + in_fps / 8;
 
+	/*
+	 * Assume YCbCr 4:2:2.  The RGB-vs-422 choice only matters for
+	 * 1280x720@60 (the vendor has a dedicated RGB table); distinguishing
+	 * them needs the ADV7604 AVI poll (Stage 2), so a 720p60 RGB source
+	 * gets the 422 table for now.
+	 */
 	table = want_half ?
 		avm_cvx8897_half_rate(w, h, in_fps, false, interlaced) : NULL;
 	if (!table)

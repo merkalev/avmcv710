@@ -17,8 +17,10 @@
  *     (usb_kill_anchored_urbs), flushes the workqueue, then frees the
  *     buffers.  disconnect() additionally unregisters the v4l2 device.
  */
+#include <linux/atomic.h>
 #include <linux/slab.h>
 #include <linux/usb.h>
+#include <linux/workqueue.h>
 #include <media/videobuf2-v4l2.h>
 
 #include "avmcv710.h"
@@ -38,6 +40,7 @@
 #define AVM_BOOT_ATTEMPTS	3
 
 static void avm_free_urbs(struct avm_device *dev);
+static void avm_watchdog(struct work_struct *work);
 
 /*
  * Return every queued-but-unfilled buffer to vb2.
@@ -165,6 +168,11 @@ static void avm_urb_complete(struct urb *urb)
 	struct avm_urb *u = urb->context;
 	struct avm_device *dev = u->dev;
 	unsigned long flags;
+
+	/* A completed EP 0x83 chunk means the FPGA produced data (even an
+	 * errored completion broke the silence - the watchdog keys off
+	 * completions, not successful payloads). */
+	atomic64_inc(&dev->urb_chunks);
 
 	u->err = urb->status != 0;
 
@@ -344,6 +352,12 @@ static int avm_usb_probe(struct usb_interface *intf,
 	spin_lock_init(&dev->sig_lock);
 	dev->sig.valid = false;
 
+	/* STREAMON watchdog: armed before registration (queue_work only
+	 * below, once all failure paths are gone), cancelled on disconnect. */
+	atomic64_set(&dev->urb_chunks, 0);
+	dev->watch_silent = false;
+	INIT_DELAYED_WORK(&dev->watch_work, avm_watchdog);
+
 	ret = avm_video_register(dev);
 	if (ret)
 		goto err_wq;
@@ -351,6 +365,7 @@ static int avm_usb_probe(struct usb_interface *intf,
 	dev_info(&udev->dev,
 		 "AVerMedia ExtremeCap U3 (CV710) ready, %u x %u byte URBs\n",
 		 AVM_NUM_URBS, AVM_CHUNK_BYTES);
+	queue_delayed_work(system_wq, &dev->watch_work, 5 * HZ);
 	return 0;
 
 err_wq:
@@ -364,6 +379,43 @@ err_free:
 	usb_put_dev(dev->udev);
 	kfree(dev);
 	return ret;
+}
+
+/*
+ * STREAMON watchdog: every 5 s, if streaming is up but no EP 0x83 chunk has
+ * completed since the last sample, the pipe is silently idle.  This is the
+ * soft-reload no-output signature - a replug reboots the FX3 firmware, a
+ * module reload does not, so URBs just sit unfulfilled with no error logged
+ * and no endpoint halt to report.  One warn when the silence starts, one
+ * info when data resumes.
+ */
+static void avm_watchdog(struct work_struct *work)
+{
+	struct avm_device *dev = container_of(work, struct avm_device,
+					      watch_work.work);
+	u64 chunks = atomic64_read(&dev->urb_chunks);
+	bool streaming = READ_ONCE(dev->streaming);
+
+	if (streaming) {
+		if (chunks == dev->watch_last_chunks) {
+			if (!dev->watch_silent) {
+				dev->watch_silent = true;
+				dev->watch_silent_at = ktime_get_seconds();
+				dev_warn(&dev->udev->dev,
+					 "watchdog: STREAMON but no EP0x83 chunk "
+					 "completed for 5 s - silent FPGA after "
+					 "a soft reload? Replug the device\n");
+			}
+		} else if (dev->watch_silent) {
+			dev->watch_silent = false;
+			dev_info(&dev->udev->dev,
+				 "watchdog: EP0x83 data resumed after %llu s\n",
+				 (u64)(ktime_get_seconds() -
+				       dev->watch_silent_at));
+		}
+	}
+	dev->watch_last_chunks = chunks;
+	queue_delayed_work(system_wq, &dev->watch_work, 5 * HZ);
 }
 
 static void avm_usb_disconnect(struct usb_interface *intf)
@@ -385,6 +437,7 @@ static void avm_usb_disconnect(struct usb_interface *intf)
 	mutex_unlock(&dev->stream_lock);
 
 	usb_kill_anchored_urbs(&dev->urb_anchor);
+	cancel_delayed_work_sync(&dev->watch_work);
 	cancel_work_sync(&dev->cvx_work);
 	flush_workqueue(dev->wq);
 

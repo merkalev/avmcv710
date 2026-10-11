@@ -191,6 +191,15 @@ struct avm_device {
 	u32 cvx_req_fps;	/* consumer-requested rate (0 = none) */
 	bool cvx_prog_half;	/* converter currently set to half rate */
 	u32 cvx_prog_serial;	/* parser mode_serial when last programmed */
+
+	/* STREAMON watchdog (avmcv710-usb.c): a streaming pipe that stops
+	 * producing EP 0x83 data while URBs stay idle is the soft-reload
+	 * no-output symptom (silent FPGA, no halted endpoint to log). */
+	struct delayed_work watch_work;
+	atomic64_t urb_chunks;	/* completed EP 0x83 chunks, any status */
+	u64 watch_last_chunks;	/* chunks at the previous 5 s sample */
+	bool watch_silent;	/* last sample found the pipe idle */
+	u64 watch_silent_at;	/* seconds when the silence was spotted */
 };
 
 /* avmcv710-hw.c */

@@ -425,6 +425,15 @@ static int avm_start_streaming(struct vb2_queue *q, unsigned int count)
 	 */
 	WRITE_ONCE(dev->streaming, true);
 
+	/* Watchdog baseline: measure a new stream from its start. */
+	dev->watch_last_chunks = atomic64_read(&dev->urb_chunks);
+	dev->watch_silent = false;
+	dev_info(&dev->udev->dev,
+		 "STREAMON: %ux%u YUYV, cvx=%s req_fps=%u\n",
+		 dev->fmt.width, dev->fmt.height,
+		 avm_cvx8897_enabled() ? "on" : "off",
+		 READ_ONCE(dev->cvx_req_fps));
+
 	/* Drop any error state left from a previous stream. */
 	for (i = 0; i < AVM_NUM_URBS; i++) {
 		dev->urbs[i].err = false;

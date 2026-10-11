@@ -9,7 +9,7 @@
 #   make -C /lib/modules/$(uname -r)/build M=$(pwd) modules
 #   (BSD make will not work; this requires GNU make.)
 
-avmcv710-y := avmcv710-hw.o avmcv710-parser.o avmcv710-status.o avmcv710-usb.o avmcv710-video.o
+avmcv710-y := avmcv710-hw.o avmcv710-parser.o avmcv710-usb.o avmcv710-video.o
 
 # In-tree: built according to Kconfig.  Out-of-tree (no CONFIG symbol):
 # build as a standalone module.
@@ -26,13 +26,8 @@ ccflags-y += -Wframe-larger-than=2048
 KDIR ?= /lib/modules/$(shell uname -r)/build
 
 .PHONY: modules clean install
-modules: avmcv710-bmp.h
+modules:
 	$(MAKE) -C $(KDIR) M=$(CURDIR) modules
-
-# Regenerate the overlay header (640x480 YUY2 bitmaps from the vendor
-# driver) when the generator changes and the header is missing.
-avmcv710-bmp.h: tools/gen_bmp.py
-	python3 tools/gen_bmp.py
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(CURDIR) clean

@@ -30,10 +30,25 @@
  */
 #define AVM_URB_MAX_ERRORS	8
 
+/*
+ * The FX3 occasionally answers an EP1 read short/-EAGAIN in the first
+ * milliseconds after enumeration; replaying the whole (idempotent) bootstrap is
+ * the userspace driver's recovery, so allow a few attempts.
+ */
+#define AVM_BOOT_ATTEMPTS	3
+
 static void avm_free_urbs(struct avm_device *dev);
 
-/* Return every queued-but-unfilled buffer to vb2 as errors. */
-void avm_return_buffers(struct avm_device *dev)
+/*
+ * Return every queued-but-unfilled buffer to vb2.
+ *
+ * The state matters: stop_streaming() and disconnect must hand buffers back
+ * as VB2_BUF_STATE_ERROR, but a *failed* start_streaming() must hand them
+ * back as VB2_BUF_STATE_QUEUED (see the start_streaming() contract in
+ * videobuf2-core.h).  Using ERROR there puts them on q->done_list and trips
+ * WARN_ON(!list_empty(&q->done_list)) in vb2_start_streaming().
+ */
+void avm_return_buffers(struct avm_device *dev, enum vb2_buffer_state state)
 {
 	struct avm_buffer *buf, *tmp;
 	unsigned long flags;
@@ -46,7 +61,7 @@ void avm_return_buffers(struct avm_device *dev)
 
 	list_for_each_entry_safe(buf, tmp, &bufq, list) {
 		list_del_init(&buf->list);
-		vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
+		vb2_buffer_done(&buf->vb.vb2_buf, state);
 	}
 }
 
@@ -114,6 +129,10 @@ static void avm_parse_work(struct work_struct *work)
 		 * to the per-URB retry cap, then leave it out of the pool.
 		 */
 		if (u->err) {
+			if (u->errors < 3)
+				dev_warn_ratelimited(&dev->udev->dev,
+					"video URB status %d (error %u)\n",
+					u->urb->status, u->errors + 1);
 			if (++u->errors > AVM_URB_MAX_ERRORS) {
 				dev_warn_ratelimited(&dev->udev->dev,
 					"bulk URB failing repeatedly; retiring one URB\n");
@@ -221,6 +240,7 @@ static int avm_usb_probe(struct usb_interface *intf,
 {
 	struct usb_device *udev = interface_to_usbdev(intf);
 	struct avm_device *dev;
+	unsigned int attempt;
 	int ret;
 
 	if (intf->cur_altsetting->desc.bInterfaceNumber != 0)
@@ -260,24 +280,68 @@ static int avm_usb_probe(struct usb_interface *intf,
 	}
 	INIT_WORK(&dev->parse_work, avm_parse_work);
 
-	/* Replay the 871-command FX3/ADV7604 bring-up (bulk EP1). */
-	ret = avm_bootstrap(dev);
+	/*
+	 * Replay the 871-command FX3/ADV7604 bring-up (bulk EP1).
+	 *
+	 * A soft rmmod/modprobe leaves the FX3 powered, so its EP1 data toggle
+	 * and any unread reply byte survive into the next probe; the first
+	 * bootstrap read then returns a short packet and the whole sequence
+	 * desyncs into -EOVERFLOW and a wedged endpoint.  Drain the FIFO, reset
+	 * both EP1 toggles, and park the FPGA + reset the stream DMA (the
+	 * setFpgaIdle + resetStreamDMA pair the userspace driver brackets the
+	 * command list with) before every attempt.  Retry the idempotent
+	 * sequence a few times, as the first EP1 transaction after enumeration
+	 * can transiently fail.
+	 */
+	msleep(100);
+
+	for (attempt = 0; attempt < AVM_BOOT_ATTEMPTS; attempt++) {
+		/*
+		 * Every attempt first drains any unread EP1 reply byte left by
+		 * the previous session (a cheap 20 ms read).  Only the recovery
+		 * attempts additionally reset the endpoint toggles; CLEAR_FEATURE
+		 * costs ~5 s per call on this device, so keep it off the normal
+		 * path and drain again after it.
+		 */
+		if (attempt) {
+			avm_ep1_drain(dev);
+			usb_clear_halt(udev, usb_rcvbulkpipe(udev, AVM_EP_CTRL_IN));
+			usb_clear_halt(udev, usb_sndbulkpipe(udev, AVM_EP_CTRL_OUT));
+		}
+		avm_ep1_drain(dev);
+
+		avm_fpga_work_mode(dev, false);
+		avm_reset_stream_dma(dev);
+
+		ret = avm_bootstrap(dev);
+		if (!ret)
+			break;
+		dev_warn(&udev->dev, "bootstrap attempt %u/%u failed: %d\n",
+			 attempt + 1, AVM_BOOT_ATTEMPTS, ret);
+		msleep(100);
+	}
 	if (ret) {
 		dev_err(&udev->dev, "bootstrap failed: %d\n", ret);
 		goto err_wq;
 	}
 	avm_fpga_work_mode(dev, false);
+	avm_reset_stream_dma(dev);
 	avm_parser_reset(dev);
 
 	usb_set_intfdata(intf, dev);
 
+	/*
+	 * Stage 0 (video-only bring-up): no receiver poll runs, so the
+	 * signal snapshot stays invalid and the parser falls back to its
+	 * word-count mode table.  sig_lock must still be live because the
+	 * parser and the format probes read dev->sig under it.
+	 */
+	spin_lock_init(&dev->sig_lock);
+	dev->sig.valid = false;
+
 	ret = avm_video_register(dev);
 	if (ret)
 		goto err_wq;
-
-	/* Started in probe so g_fmt can report the live measurement and the
-	 * splash pump is armed even before the first STREAMON. */
-	avm_status_init(dev);
 
 	dev_info(&udev->dev,
 		 "AVerMedia ExtremeCap U3 (CV710) ready, %u x %u byte URBs\n",
@@ -310,10 +374,6 @@ static void avm_usb_disconnect(struct usb_interface *intf)
 	 * workqueue destroy / URB free / device free must outlive any user
 	 * that is still holding the video node.
 	 */
-	/* The status worker speaks EP1: stop it before any teardown I2C
-	 * traffic so a status read can never race the pipe teardown. */
-	avm_status_shutdown(dev);
-
 	mutex_lock(&dev->stream_lock);
 	dev->streaming = false;
 	mutex_unlock(&dev->stream_lock);

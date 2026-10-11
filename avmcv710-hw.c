@@ -66,6 +66,33 @@ int avm_ep1_read(struct avm_device *dev, u8 *data, size_t len)
 	return avm_ep1_read_t(dev, data, len, AVM_BOOT_READ_TIMEOUT);
 }
 
+/*
+ * Drain any bytes left in the EP1 IN FIFO by a previous session.
+ *
+ * If a status/fpga read is aborted (URB killed on timeout) after the FX3 has
+ * already queued its reply, that reply sits in the endpoint FIFO while the
+ * host's data toggle is left behind.  The next bootstrap then reads the stale
+ * byte as a short packet (-EIO), every following read is shifted, and the FX3
+ * eventually overruns (-EOVERFLOW) and wedges the endpoint.  Reading the
+ * leftover out with the same pipe advances the host toggle to match the
+ * device, so the next bootstrap starts clean.  A short read or a timeout
+ * means the FIFO is empty.
+ */
+void avm_ep1_drain(struct avm_device *dev)
+{
+	u8 buf[512];
+	int actual, ret, i;
+
+	for (i = 0; i < 4; i++) {
+		actual = 0;
+		ret = usb_bulk_msg(dev->udev,
+				   usb_rcvbulkpipe(dev->udev, AVM_EP_CTRL_IN),
+				   buf, sizeof(buf), &actual, 20);
+		if (ret || actual < (int)sizeof(buf))
+			break;
+	}
+}
+
 /* Status-path EP1 transactions (500 ms, like the userspace driver). */
 #define AVM_STATUS_IO_TIMEOUT	500
 
@@ -86,6 +113,8 @@ int avm_i2c_write(struct avm_device *dev, u8 slave7, u8 reg, u8 val)
 
 	mutex_lock(&dev->ctrl_lock);
 	ret = avm_ep1_write_t(dev, cmd, sizeof(cmd), AVM_STATUS_IO_TIMEOUT);
+	if (ret)
+		avm_ep1_drain(dev);
 	mutex_unlock(&dev->ctrl_lock);
 	return ret;
 }
@@ -94,34 +123,57 @@ int avm_i2c_read_block(struct avm_device *dev, u8 slave7, u8 reg,
 		       u8 *data, u8 len)
 {
 	u8 cmd[5] = { 0x02, slave7, 0x01, len, reg };
-	int ret;
+	int ret, wret;
 
 	if (WARN_ON_ONCE(len == 0 || len > 32))
 		return -EINVAL;
 
 	mutex_lock(&dev->ctrl_lock);
-	ret = avm_ep1_write_t(dev, cmd, sizeof(cmd), AVM_STATUS_IO_TIMEOUT);
-	if (!ret)
+	wret = avm_ep1_write_t(dev, cmd, sizeof(cmd), AVM_STATUS_IO_TIMEOUT);
+	if (!wret)
 		ret = avm_ep1_read_t(dev, data, len, AVM_STATUS_IO_TIMEOUT);
+	else
+		ret = wret;
+	if (ret) {
+		/*
+		 * A failed read can leave the FX3's late reply sitting in the
+		 * EP1 IN FIFO; the next control command then reads that stale
+		 * byte, desyncs, and wedges the endpoint.  Consume it now.
+		 */
+		avm_ep1_drain(dev);
+		dev_warn_ratelimited(&dev->udev->dev,
+			"i2c read %02x/%02x len %u failed: w=%d r=%d\n",
+			slave7, reg, len, wret, ret);
+	}
 	mutex_unlock(&dev->ctrl_lock);
 	return ret;
 }
 
 /*
- * FPGA work mode: ADV7604-style indirect control at I2C 0x10 reg 0x05.
+ * FPGA work mode: indirect control at I2C 0x10 reg 0x05.
  * bit1 set = work (streaming), bit1 clear = idle (bootstrap / parked).
  * Matches CLFE3::SetWorkMode / SetIdleMode.
+ *
+ * Write-only.  The bootstrap's last write to 0x05 is exactly 0x02 (work bit
+ * only), so the register's other bits are zero and there is nothing to
+ * preserve.  The old read-modify-write read 0x05 first, and that EP1 IN
+ * transfer intermittently fails -EAGAIN just after the bootstrap and at
+ * STREAMON (the FX3 is still busy); the aborted URB then leaves the endpoint
+ * desynced and the following control command times out.  Writing the known
+ * value avoids the failing read entirely.  The same is safe before the
+ * bootstrap: the command list reprograms 0x05 from scratch.
  */
 int avm_fpga_work_mode(struct avm_device *dev, bool work)
 {
-	u8 mode = 0;
+	u8 mode = work ? 0x02 : 0x00;
+	int ret;
 
-	avm_i2c_read_block(dev, 0x10, 0x05, &mode, 1);
-	if (work)
-		mode |= 0x02;
-	else
-		mode &= ~0x02;
-	return avm_i2c_write(dev, 0x10, 0x05, mode);
+	ret = avm_i2c_write(dev, 0x10, 0x05, mode);
+	if (ret)
+		dev_warn_ratelimited(&dev->udev->dev,
+			"fpga work mode: write 0x10/0x05=0x%02x failed: %d\n",
+			mode, ret);
+	return ret;
 }
 
 /*
@@ -138,6 +190,9 @@ int avm_reset_stream_dma(struct avm_device *dev)
 	mutex_lock(&dev->ctrl_lock);
 	ret = avm_ep1_write(dev, &cmd, 1);
 	mutex_unlock(&dev->ctrl_lock);
+	if (ret)
+		dev_warn_ratelimited(&dev->udev->dev,
+			"reset stream DMA (0x14) failed: %d\n", ret);
 	return ret;
 }
 

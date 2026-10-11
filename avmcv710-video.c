@@ -10,6 +10,7 @@
  * change mid-stream can never overflow a queued buffer; vb2 payload is set
  * to the *actual* delivered frame size per buffer.
  */
+#include <linux/delay.h>
 #include <linux/slab.h>
 #include <linux/usb.h>
 #include <media/v4l2-dev.h>
@@ -380,13 +381,6 @@ static int avm_start_streaming(struct vb2_queue *q, unsigned int count)
 		return 0;
 	avm_parser_reset(dev);
 
-	/* FPGA work mode then clean FX3 DMA pointer. */
-	ret = avm_fpga_work_mode(dev, true);
-	if (!ret)
-		ret = avm_reset_stream_dma(dev);
-	if (ret)
-		goto err;
-
 	/*
 	 * Publish streaming BEFORE submitting URBs: a URB can complete
 	 * before the last submit returns, and the worker must already see
@@ -400,6 +394,14 @@ static int avm_start_streaming(struct vb2_queue *q, unsigned int count)
 		dev->urbs[i].errors = 0;
 	}
 
+	/*
+	 * Submit the EP 0x83 video URBs *first*, then clean the FX3 DMA
+	 * pointer and enable FPGA work mode - the exact order the userspace
+	 * start path uses (UsbStream::queueFrameRead: queueAllFrameReads ->
+	 * sendResetStreamDma -> setFpgaWork).  Enabling work mode with no
+	 * video reader queued leaves the FX3 DMA with nowhere to drain.
+	 */
+	ret = 0;
 	for (i = 0; i < AVM_NUM_URBS; i++) {
 		struct urb *urb = dev->urbs[i].urb;
 
@@ -413,6 +415,31 @@ static int avm_start_streaming(struct vb2_queue *q, unsigned int count)
 	if (ret)
 		goto err;
 
+	/*
+	 * Clean the FX3 DMA pointer, then enable FPGA work mode.
+	 *
+	 * These are EP1 *control* commands, independent of the EP 0x83 video
+	 * pipe.  The userspace driver issues the same pair and ignores a
+	 * failure - a bulk timeout here is almost always a synchronisation
+	 * artifact (the FX3 finishes the command but the completion is lost),
+	 * not a dead endpoint.  Retry once, then warn and stream anyway:
+	 * aborting the whole STREAMON on a transient control timeout only
+	 * produced a black preview plus a vb2 buffer-state warning.
+	 */
+	ret = avm_reset_stream_dma(dev);
+	if (!ret)
+		ret = avm_fpga_work_mode(dev, true);
+	if (ret) {
+		msleep(50);
+		ret = avm_reset_stream_dma(dev);
+		if (!ret)
+			ret = avm_fpga_work_mode(dev, true);
+	}
+	if (ret)
+		dev_warn(&dev->udev->dev,
+			 "FPGA/DMA start command failed: %d (streaming anyway)\n",
+			 ret);
+
 	dev_dbg(&dev->udev->dev, "streaming: %u URBs submitted\n",
 		AVM_NUM_URBS);
 	return 0;
@@ -424,7 +451,9 @@ err:
 	WRITE_ONCE(dev->streaming, false);
 	usb_kill_anchored_urbs(&dev->urb_anchor);
 	flush_workqueue(dev->wq);
-	avm_return_buffers(dev);
+	/* vb2 re-queues on a failed STREAMON, so hand buffers back QUEUED
+	 * (not ERROR) - see avm_return_buffers() and videobuf2-core.h. */
+	avm_return_buffers(dev, VB2_BUF_STATE_QUEUED);
 	avm_fpga_work_mode(dev, false);
 	return ret;
 }
@@ -436,6 +465,21 @@ static void avm_stop_streaming(struct vb2_queue *q)
 
 	/* vb2 core holds q->lock (== stream_lock) while calling this. */
 	WRITE_ONCE(dev->streaming, false);
+
+	/*
+	 * Park the FPGA (stop it producing frames) and reset the FX3 DMA
+	 * *before* cancelling the EP 0x83 video URBs, mirroring the userspace
+	 * shutdown (UsbStream::shutdownStream performs setFpgaIdle +
+	 * sendResetStreamDma while the frame transfers are still active, and
+	 * only then cancels them).
+	 *
+	 * Killing the video URBs first leaves the FX3 mid-DMA with its bulk IN
+	 * endpoint torn down; the firmware then stops servicing the EP1 control
+	 * pipe, the park write times out (-110) and every later command hangs
+	 * until the device is replugged.
+	 */
+	avm_fpga_work_mode(dev, false);
+	avm_reset_stream_dma(dev);
 
 	/* Kill in-flight URBs, then wait for parser work to finish. */
 	usb_kill_anchored_urbs(&dev->urb_anchor);
@@ -457,9 +501,9 @@ static void avm_stop_streaming(struct vb2_queue *q)
 	INIT_LIST_HEAD(&dev->drain_list);
 	spin_unlock_irqrestore(&dev->urbs_lock, flags);
 
-	avm_return_buffers(dev);
+	avm_return_buffers(dev, VB2_BUF_STATE_ERROR);
 
-	/* Park the FPGA; parser stays reset until the next STREAMON. */
+	/* Parser stays reset until the next STREAMON. */
 	avm_fpga_work_mode(dev, false);
 
 	dev_dbg(&dev->udev->dev,

@@ -139,15 +139,6 @@ struct avm_signal {
 	u32 poll_failures;	/* consecutive failed polls */
 };
 
-/* Overlay bitmap shown when the input is unavailable / unusable. */
-enum avm_splash {
-	AVM_SPLASH_NONE = 0,
-	AVM_SPLASH_NO_SIGNAL,
-	AVM_SPLASH_OUT_OF_RANGE,
-	AVM_SPLASH_HDCP,
-	AVM_SPLASH_CONTENT_PROTECTION,
-};
-
 struct avm_buffer {
 	struct vb2_v4l2_buffer vb;	/* must be first */
 	struct list_head list;
@@ -179,12 +170,10 @@ struct avm_device {
 	unsigned int pending_bufs;
 	struct avm_parser parser;
 
-	/* ADV7604 status poll + splash pump (delayed work, ~30 Hz) */
+	/* Signal snapshot.  Stage 0 runs no receiver poll, so this stays
+	 * invalid and the parser uses its word-count mode table. */
 	spinlock_t sig_lock;		/* protects dev->sig */
 	struct avm_signal sig;
-	enum avm_splash splash;		/* currently shown overlay */
-	u32 status_tick;
-	struct delayed_work status_work;
 
 	/* USB plumbing */
 	struct usb_anchor urb_anchor;	/* anchored streaming URBs */
@@ -195,6 +184,7 @@ struct avm_device {
 int avm_bootstrap(struct avm_device *dev);
 int avm_ep1_write(struct avm_device *dev, const u8 *data, size_t len);
 int avm_ep1_read(struct avm_device *dev, u8 *data, size_t len);
+void avm_ep1_drain(struct avm_device *dev);
 int avm_i2c_write(struct avm_device *dev, u8 slave7, u8 reg, u8 val);
 int avm_i2c_read_block(struct avm_device *dev, u8 slave7, u8 reg,
 		       u8 *data, u8 len);
@@ -206,17 +196,12 @@ int avm_video_register(struct avm_device *dev);
 void avm_source_change(struct avm_device *dev);
 
 /* avmcv710-usb.c */
-void avm_return_buffers(struct avm_device *dev);
+void avm_return_buffers(struct avm_device *dev, enum vb2_buffer_state state);
 void avm_usb_release(struct avm_device *dev);
-
-/* avmcv710-status.c */
-void avm_status_init(struct avm_device *dev);
-void avm_status_shutdown(struct avm_device *dev);
 
 /* avmcv710-parser.c */
 void avm_parser_reset(struct avm_device *dev);
 void avm_parser_feed(struct avm_device *dev, u32 *d, u32 count);
 void avm_deliver_frame(struct avm_device *dev, const u8 *src, u32 words);
-const u8 *avm_splash_bmp(enum avm_splash kind, u32 *words);
 
 #endif /* AVM_CV710_H */

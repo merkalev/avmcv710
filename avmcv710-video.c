@@ -324,7 +324,16 @@ static int avm_unsubscribe_event(struct v4l2_fh *fh,
 static const struct v4l2_file_operations avm_fops = {
 	.owner		= THIS_MODULE,
 	.open		= v4l2_fh_open,
-	.release	= v4l2_fh_release,
+	/*
+	 * vb2_fop_release, NOT v4l2_fh_release: the latter only drops the
+	 * event-queue handle, leaving the vb2 queue allocated (q->num_buffers
+	 * != 0) and any active stream uncancelled.  The next REQBUFS/S_FMT on
+	 * the re-opened node then failed with -EBUSY, so OBS froze on every
+	 * resolution/fps change until the device was replugged; a crashed or
+	 * killed consumer also kept the FPGA DMA running forever (system-wide
+	 * load).  vb2_fop_release frees the buffers and cancels streaming.
+	 */
+	.release	= vb2_fop_release,
 	.read		= vb2_fop_read,
 	.poll		= vb2_fop_poll,
 	.mmap		= vb2_fop_mmap,

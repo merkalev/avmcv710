@@ -75,6 +75,8 @@ struct avm_urb {
 	u8 *transfer;		/* URB DMA target (AVM_CHUNK_BYTES) */
 	u8 *parse_buf;		/* headroom buffer passed to the parser */
 	struct list_head done;	/* chained in dev->drain_list */
+	bool err;		/* completion carried a nonzero status */
+	unsigned int errors;	/* consecutive completion errors */
 };
 
 /* Framing parser state (port of Device::onFrameData, kernel-safe) */

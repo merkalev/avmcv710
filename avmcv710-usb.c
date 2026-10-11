@@ -23,6 +23,13 @@
 
 #include "avmcv710.h"
 
+/*
+ * Consecutive completion errors after which a single URB is retired from the
+ * pool.  Transient bulk errors recover well before this; a persistently
+ * failing endpoint stops being resubmitted instead of spinning the worker.
+ */
+#define AVM_URB_MAX_ERRORS	8
+
 static void avm_free_urbs(struct avm_device *dev);
 
 /* Return every queued-but-unfilled buffer to vb2 as errors. */
@@ -79,8 +86,12 @@ static void avm_parse_work(struct work_struct *work)
 	 */
 	if (READ_ONCE(dev->streaming)) {
 		list_for_each_entry(u, &batch, done) {
-			u32 words = u->urb->actual_length / 4;
+			u32 words;
 
+			/* an errored URB holds no valid chunk */
+			if (u->err)
+				continue;
+			words = u->urb->actual_length / 4;
 			if (words > AVM_CHUNK_WORDS)
 				words = AVM_CHUNK_WORDS;
 			avm_parser_feed(dev, (u32 *)u->parse_buf, words);
@@ -95,6 +106,24 @@ static void avm_parse_work(struct work_struct *work)
 		list_del_init(&u->done);
 		if (!READ_ONCE(dev->streaming))
 			continue;
+
+		/*
+		 * A transient bulk error (overflow, babble, timeout) must not
+		 * permanently retire one of the few URBs, but a persistently
+		 * failing endpoint must not spin either: keep resubmitting up
+		 * to the per-URB retry cap, then leave it out of the pool.
+		 */
+		if (u->err) {
+			if (++u->errors > AVM_URB_MAX_ERRORS) {
+				dev_warn_ratelimited(&dev->udev->dev,
+					"bulk URB failing repeatedly; retiring one URB\n");
+				continue;
+			}
+		} else {
+			u->errors = 0;
+		}
+		u->err = false;
+
 		usb_anchor_urb(u->urb, &dev->urb_anchor);
 		ret = usb_submit_urb(u->urb, GFP_KERNEL);
 		if (ret) {
@@ -106,15 +135,18 @@ static void avm_parse_work(struct work_struct *work)
 	}
 }
 
-/* URB completion - atomic context only: chain + kick the worker. */
+/* URB completion - atomic context only: chain + kick the worker.  Every
+ * completion is chained, errors included: the worker decides whether to
+ * parse (clean chunks only) and to resubmit (while streaming, up to a retry
+ * cap).  A single transient bulk error must not silently shrink the URB
+ * pool until the stream dies. */
 static void avm_urb_complete(struct urb *urb)
 {
 	struct avm_urb *u = urb->context;
 	struct avm_device *dev = u->dev;
 	unsigned long flags;
 
-	if (urb->status != 0)
-		return;	/* kill/unplug/stall: pipeline drains quietly */
+	u->err = urb->status != 0;
 
 	spin_lock_irqsave(&dev->urbs_lock, flags);
 	list_add_tail(&u->done, &dev->drain_list);
@@ -288,6 +320,18 @@ static void avm_usb_disconnect(struct usb_interface *intf)
 
 	usb_kill_anchored_urbs(&dev->urb_anchor);
 	flush_workqueue(dev->wq);
+
+	/*
+	 * Unregistering the video device does not stop the vb2 queue, so a
+	 * consumer blocked in read()/poll() would otherwise hang until it
+	 * times out.  Flag the queue as errored to wake it (poll() reports
+	 * POLLERR, read()/DQBUF return -EIO); the queued buffers are then
+	 * returned when the file is closed (vb2 cancel -> stop_streaming).
+	 * Guarded to streaming so the sticky error flag cannot leak into a
+	 * later stream on the same queue.
+	 */
+	if (vb2_is_streaming(&dev->q))
+		vb2_queue_error(&dev->q);
 
 	video_unregister_device(&dev->vdev);
 }

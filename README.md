@@ -37,6 +37,13 @@ port is written so that no userspace-visible condition can panic the kernel:
   kills → `flush_workqueue()` → returns buffers, in that order.  The final
   `destroy_workqueue()` / URB free only happens in the video-device release
   callback, i.e. after every open file handle is gone.
+- **Error-resilient streaming.** The URB completion callback chains every
+  transfer (errors included); the worker parses only clean chunks and
+  resubmits a transiently failed URB, retiring one only after a retry cap so
+  a persistently failing endpoint cannot spin the worker.  On disconnect the
+  vb2 queue is flagged errored (`vb2_queue_error()`), so a blocked
+  reader/poller wakes with `-EIO`/`POLLERR` instead of hanging and queued
+  buffers are returned on close.
 - **Parsing only in a workqueue.** The URB completion callback only chains
   the chunk and kicks the worker.  No locking, allocation or v4l2 calls in
   atomic context.
@@ -50,7 +57,10 @@ port is written so that no userspace-visible condition can panic the kernel:
 - Resolution auto-detected from the frame word count; the most common sink
   geometry (1920x1080) is reported before the first frame.  Planes are always
   sized `AVM_FRAME_BPF` (4,608,000 B) so a mid-stream mode change can never
-  overflow the buffer.
+  overflow the buffer.  Format negotiation is source-paced (`S_FMT` reports
+  the live geometry) and every locked change raises
+  `V4L2_EVENT_SOURCE_CHANGE` so a consumer re-queries `g_fmt` instead of
+  reading the new raster with the old stride.
 - Interlaced 1080i / 576i / 480i fields detected from word counts and woven
   into full frames (device parity flag used once observed to alternate).
   The CV-28k re-classification is ported: when the FPGA's C0 interlace bit is

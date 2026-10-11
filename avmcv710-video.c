@@ -394,6 +394,12 @@ static int avm_start_streaming(struct vb2_queue *q, unsigned int count)
 	 */
 	WRITE_ONCE(dev->streaming, true);
 
+	/* Drop any error state left from a previous stream. */
+	for (i = 0; i < AVM_NUM_URBS; i++) {
+		dev->urbs[i].err = false;
+		dev->urbs[i].errors = 0;
+	}
+
 	for (i = 0; i < AVM_NUM_URBS; i++) {
 		struct urb *urb = dev->urbs[i].urb;
 

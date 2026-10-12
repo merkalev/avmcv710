@@ -218,6 +218,14 @@ int avm_bootstrap(struct avm_device *dev)
 	for (i = 0; i < AVM_BOOT_CMD_COUNT; i++) {
 		const struct avm_boot_cmd *c = &avm_boot_cmds[i];
 
+		/* Never feed the 2048-byte scratch more than it holds: a
+		 * regenerated trace with an oversized entry would overrun
+		 * the stack/heap buffer below (today's table max is 512). */
+		if (WARN_ON_ONCE(c->len > 2048)) {
+			ret = -EINVAL;
+			break;
+		}
+
 		if (c->op == AVM_BOOT_OP_WRITE) {
 			if (WARN_ON_ONCE(c->off + c->len > AVM_BOOT_BLOB_BYTES)) {
 				ret = -EINVAL;

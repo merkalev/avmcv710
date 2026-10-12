@@ -215,7 +215,11 @@ static int avm_init_urbs(struct avm_device *dev)
 	return 0;
 
 fail:
-	while (i--) {
+	/* Free index i itself too: the loop below starts at i, so the
+	 * entry whose kmalloc/usb_alloc_urb failed (parse_buf allocated,
+	 * urb NULL, or both) is reclaimed instead of leaking its 2 MB
+	 * parse_buf on the heap forever. */
+	for (; i >= 0; i--) {
 		struct avm_urb *u = &dev->urbs[i];
 
 		if (u->urb) {
@@ -343,8 +347,6 @@ static int avm_usb_probe(struct usb_interface *intf,
 	avm_reset_stream_dma(dev);
 	avm_parser_reset(dev);
 
-	usb_set_intfdata(intf, dev);
-
 	/*
 	 * ADV7604 status snapshot + standby overlay pump.  This only
 	 * initializes the worker and the overlay scratch buffer; the work is
@@ -369,6 +371,11 @@ static int avm_usb_probe(struct usb_interface *intf,
 	if (ret)
 		dev_warn(&udev->dev,
 			 "ALSA capture unavailable, video-only (%d)\n", ret);
+
+	/* Set intfdata only once every fallible step passed: a probe that
+	 * fails after this point must not leave intfdata pointing at a
+	 * freed dev (disconnect would dereference a dangling pointer). */
+	usb_set_intfdata(intf, dev);
 
 	dev_info(&udev->dev,
 		 "AVerMedia ExtremeCap U3 (CV710) ready, %u x %u byte URBs\n",
@@ -454,6 +461,18 @@ static void avm_usb_disconnect(struct usb_interface *intf)
 	cancel_delayed_work_sync(&dev->watch_work);
 	cancel_work_sync(&dev->cvx_work);
 	flush_workqueue(dev->wq);
+
+	/*
+	 * Drop the ALSA module pin now, not from the vdev release callback:
+	 * a registered sound card holds a reference on its driver module, so
+	 * an unbind that merely unregisters the video node used to leave the
+	 * module "in use" with no way to rmmod it (the OBS freeze saga).  The
+	 * parser flush above guarantees no 0x58 push can race the dying flag;
+	 * a still-open arecord keeps working and defers the actual card free
+	 * (snd_card_free_when_closed), which pins the module until closed -
+	 * exactly right: the driver must not vanish under a live PCM.
+	 */
+	avm_audio_fini(dev);
 
 	/*
 	 * Unregistering the video device does not stop the vb2 queue, so a

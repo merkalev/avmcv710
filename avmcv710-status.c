@@ -281,6 +281,7 @@ int avm_status_init(struct avm_device *dev)
 	/* Initialize the work before anything that can fail, so a failed
 	 * init followed by avm_status_fini() cancels a valid work struct. */
 	INIT_DELAYED_WORK(&dev->status_work, avm_status_work);
+	dev->status_inited = true;
 	/* one AVM_FRAME_BPF scratch for the composited overlay */
 	dev->splash_frame = kvzalloc(AVM_FRAME_BPF, GFP_KERNEL);
 	if (!dev->splash_frame)
@@ -306,6 +307,11 @@ void avm_status_stop(struct avm_device *dev)
 
 void avm_status_fini(struct avm_device *dev)
 {
+	/* Probe error paths that fail before avm_status_init() must not
+	 * cancel a zeroed work struct (CONFIG_DEBUG_OBJECTS_WORK WARNs). */
+	if (!dev->status_inited)
+		return;
+	dev->status_inited = false;
 	avm_status_stop(dev);
 	kvfree(dev->splash_frame);
 	dev->splash_frame = NULL;

@@ -73,6 +73,18 @@ struct avm_audio;
 
 struct avm_device;
 
+/*
+ * Mode descriptor.  1 word = 1 YUY2 macropixel = 2 px.  `target` is the
+ * word count a C1 must carry to pass the exact-size gate (CV-23): the
+ * standard table entries are fixed, and the adaptive entries adopt the
+ * word count of the sample that matched the ADV7604 measurement.
+ */
+struct avm_mode {
+	u32 w, h, target;
+	const char *name;
+	bool interlaced;
+};
+
 /* Per-USB-request bookkeeping */
 struct avm_urb {
 	struct avm_device *dev;	/* owning device */
@@ -121,6 +133,13 @@ struct avm_parser {
 	u32 target_words;	/* words expected for active mode */
 	unsigned int mode_serial; /* bumped on each locked switch */
 	u32 frame_sequence;	/* DQBUF sequence counter (V4L2_BUF.sequence) */
+
+	/* scratch mode for the adaptive measurement path (avm_detect_mode):
+	 * populated on every frame examined by the parser worker; the CV-23
+	 * exact-size gate compares against ->target, which the tolerant
+	 * branches set to the observed word count.  Per-device: two adapters
+	 * must not share a static scratch mode. */
+	struct avm_mode meas;
 
 	/* liveness / pacing: last time real frame data was seen, and the
 	 * rolling frame rate (used to pace the no-signal/out-of-range
@@ -197,6 +216,7 @@ struct avm_device {
 	enum avm_splash splash_cached;	/* bitmap held in splash_frame */
 	u8 *splash_frame;		/* AVM_FRAME_BPF composited overlay */
 	u32 splash_w, splash_h, splash_words;
+	bool status_inited;		/* work initialized (probe err-path guard) */
 
 	/* ALSA capture PCM (avmcv710-audio.c): the parser pushes 0x58 audio
 	 * payload bytes into the PCM DMA buffer.  NULL until probe registers

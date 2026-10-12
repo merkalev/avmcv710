@@ -28,12 +28,6 @@
  * Keeps the interlaced modes (field word counts) distinct from every
  * progressive mode so scan mode can be picked without a status read.
  */
-struct avm_mode {
-	u32 w, h, target;
-	const char *name;
-	bool interlaced;
-};
-
 static const struct avm_mode avm_modes[] = {
 	{ 1920, 1080, 1036800, "1080p", false },
 	{ 1920, 1080,  518400, "1080i", true  },   /* field words */
@@ -43,9 +37,6 @@ static const struct avm_mode avm_modes[] = {
 	{  720,  480,  172800, "480p ", false },
 	{  720,  480,   86400, "480i ", true  },   /* field words */
 };
-
-/* Scratch mode for the adaptive path (single parser worker, no nesting). */
-static struct avm_mode avm_meas_mode;
 
 /*
  * The distinctive per-field word counts of the standard interlaced modes:
@@ -90,6 +81,12 @@ static const struct avm_mode *avm_detect_mode(struct avm_device *dev,
 
 	if (sig.valid && sig.tmds_locked && sig.w >= 320 && sig.w <= 4095 &&
 	    sig.h >= 120 && sig.h <= 2048 && (sig.w & 1) == 0) {
+		/* Per-device scratch mode: the adaptive entries adopt the
+		 * observed word count, so a tolerant match locks exactly on
+		 * the size that actually arrived (AVM_MAX_FRAME_WORDS bounds
+		 * it on the accumulation path).  No shared static: two
+		 * adapters on one host must not race their measurement. */
+		struct avm_mode *m = &dev->parser.meas;
 		bool interlaced = hw_interlaced || sig.interlaced;
 
 		/* Tie-breaker: if both scan-mode sources are clear or stale,
@@ -124,18 +121,18 @@ static const struct avm_mode *avm_detect_mode(struct avm_device *dev,
 			/* field word count must be an exact w*fieldH/2 */
 			if (field_h >= 100 && field_h <= 700 &&
 			    (u64)sig.w * field_h == (u64)words * 2) {
-				avm_meas_mode.w = sig.w;
-				avm_meas_mode.h = field_h * 2;
+				m->w = sig.w;
+				m->h = field_h * 2;
 				/* target is the FIELD word count: it must
 				 * match the incoming C1 count and the
 				 * standard-mode table entries, and it is
 				 * what avm_handle_frame_end() gates on.
 				 * The full woven frame is built separately
 				 * by avm_weave_field(). */
-				avm_meas_mode.target = sig.w * field_h / 2;
-				avm_meas_mode.name = "meas-i";
-				avm_meas_mode.interlaced = true;
-				return &avm_meas_mode;
+				m->target = sig.w * field_h / 2;
+				m->name = "meas-i";
+				m->interlaced = true;
+				return m;
 			}
 
 			/* Derivation failed (non-exact timing): trust the
@@ -149,12 +146,16 @@ static const struct avm_mode *avm_detect_mode(struct avm_device *dev,
 
 				if (words + tol >= expected &&
 				    words <= expected + tol) {
-					avm_meas_mode.w = sig.w;
-					avm_meas_mode.h = frame_h;
-					avm_meas_mode.target = expected;
-					avm_meas_mode.name = "meas-i";
-					avm_meas_mode.interlaced = true;
-					return &avm_meas_mode;
+					m->w = sig.w;
+					m->h = frame_h;
+					/* target = words: the tolerance window
+					 * accepted this C1, so gate exactly on
+					 * what arrived - expected would never
+					 * match a non-table timing. */
+					m->target = words;
+					m->name = "meas-i";
+					m->interlaced = true;
+					return m;
 				}
 			}
 		} else {
@@ -162,12 +163,16 @@ static const struct avm_mode *avm_detect_mode(struct avm_device *dev,
 			u64 tol = expected / 50 + 64;
 
 			if (words + tol >= expected && words <= expected + tol) {
-				avm_meas_mode.w = sig.w;
-				avm_meas_mode.h = sig.h;
-				avm_meas_mode.target = expected;
-				avm_meas_mode.name = "meas-p";
-				avm_meas_mode.interlaced = false;
-				return &avm_meas_mode;
+				m->w = sig.w;
+				m->h = sig.h;
+				/* target = words: same rationale as the
+				 * interlaced fallback - expected only matches
+				 * when the FPGA raster happens to agree with
+				 * the receiver measurement bit-for-bit. */
+				m->target = words;
+				m->name = "meas-p";
+				m->interlaced = false;
+				return m;
 			}
 		}
 	}
@@ -310,6 +315,11 @@ void avm_deliver_frame(struct avm_device *dev, const u8 *src, u32 words)
 	if (buf) {
 		list_del_init(&buf->list);
 		dev->pending_bufs--;
+		/* Advance the sequence under the same lock that pops the
+		 * buffer: the splash pump also delivers through this list
+		 * from the status worker, and a concurrent frame would make
+		 * the two workers stamp duplicate sequence numbers. */
+		buf->vb.sequence = p->frame_sequence++;
 	}
 	spin_unlock_irqrestore(&dev->urbs_lock, flags);
 
@@ -338,7 +348,6 @@ void avm_deliver_frame(struct avm_device *dev, const u8 *src, u32 words)
 	 * (OBS) accumulate latency, so stamp every delivered frame.
 	 */
 	buf->vb.vb2_buf.timestamp = ktime_get_ns();
-	buf->vb.sequence = p->frame_sequence++;
 	vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
 	atomic_inc(&p->valid_frames);
 }
@@ -446,7 +455,8 @@ static void avm_handle_frame_end(struct avm_device *dev, u32 frame_words)
 	WRITE_ONCE(p->last_real_kt, ktime_get());
 
 	/* Mode switch hysteresis: 4 consecutive same-geometry frames. */
-	if (p->active_w == mode->w && p->active_h == mode->h) {
+	if (READ_ONCE(p->active_w) == mode->w &&
+	    READ_ONCE(p->active_h) == mode->h) {
 		p->pending_count = 0;
 		mode_w_changed = false;
 	} else {
@@ -458,11 +468,14 @@ static void avm_handle_frame_end(struct avm_device *dev, u32 frame_words)
 			p->pending_count = 1;
 		}
 		if (p->pending_count >= 4) {
-			p->active_w = mode->w;
-			p->active_h = mode->h;
-			p->active_interlaced = mode->interlaced;
+			/* Cross-context writers: avm_live_geometry() (ioctl)
+			 * and the cvx8897 worker READ_ONCE these, so the
+			 * parser must publish them atomically. */
+			WRITE_ONCE(p->active_w, mode->w);
+			WRITE_ONCE(p->active_h, mode->h);
+			WRITE_ONCE(p->active_interlaced, mode->interlaced);
 			p->pending_count = 0;
-			p->mode_serial++;
+			WRITE_ONCE(p->mode_serial, READ_ONCE(p->mode_serial) + 1);
 			/* tell consumers to re-negotiate the format */
 			avm_source_change(dev);
 			mode_w_changed = false;

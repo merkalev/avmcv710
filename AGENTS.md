@@ -27,8 +27,19 @@ prepare of the new card was a NULL instruction fetch that collapsed system
 audio.  That is **fixed and committed** and audio is now opt-in
 (`avm_audio=1`, default off = the previously stable video-only module); the
 user still must verify TODO-1/2/3 on hardware (the agent cannot `sudo`).
-TODO-4 (soft-reload auto-recovery) is waiting on a user-run experiment.  The
-next agent's job is **coordinate the verification, then implement TODO-4
+
+Then a full bug hunt ("go hunt for all problems in the driver") found and
+fixed **8 more bugs** on 2026-10-12 (devlog entry `### 2026-10-12 (late)`):
+the ALSA pin not dropping on unbind (the `fix-driver.sh` FAIL), the
+adaptive-mode exact-size gate that silently dropped every non-table source
+(1366x768 etc.), a `frame_sequence` race, a cross-adapter shared scratch
+mode, the URB fail-path 2 MB leak, a pre-init `status_work` cancel, the
+bootstrap scratch guard, and the audio `hw_free` UAF barrier.
+`fix-driver.sh` was reworked to kill OBS first, poll the module refcount,
+and hand over a deliberate `rmmod -f` escape hatch when an old build's
+stray ref survives.  TODO-4 (soft-reload auto-recovery) is waiting on a
+user-run experiment.  The next agent's job is **coordinate the
+verification, then implement TODO-4
 based on the experiment result** — not to rewrite anything.
 
 ## 1. Where everything lives
@@ -264,15 +275,19 @@ Decision tree (implement based ONLY on the result):
 | TODO-2 | ADV7604 status poll | built + committed `482fed3`,`7ebb4b6` — **user test pending** |
 | TODO-3 | No-signal/out-of-range overlays | built + committed `482fed3` — **user test pending** |
 | TODO-4 | Soft-reload no output | **open** — needs user `authorized`-toggle experiment, then implement decision per §4 |
+| — | 2026-10-12 bug-hunt fixes (8 bugs: unload pin, adaptive-mode dead delivery, sequence race, adapter shared scratch mode, URB fail-path leak, status-work pre-init cancel, bootstrap scratch guard, audio hw_free barrier) | fixed + committed; see `### 2026-10-12 (late)` devlog entry |
 | — | Converter RGB-vs-422 (AVI colorspace flag) | open (P1 follow-up) |
 | — | Audio Infoframe sample-rate parse (32/44.1 kHz) | open (P1 follow-up) |
 | — | HDCP state log (doc-only) | open (P2, docs only) |
 | — | Suspend/resume safe audio | open (P2) |
 
 Current module identity (for regression diffing): `srcversion
-F8A0D1FB8A2BD916237B40C` (after TODO-2/3 + telemetry + ALSA `.prepare`
-fix/opt-in), parms `cvx8897`, `avm_audio` (bool, default off),
-`avm_audio_index`, `avm_audio_id`, `softdep: pre: snd-pcm`, 4×2 MB URBs.
+47D0A3D5A3B5820DE03EF7B` (bug-hunt fixes, 2026-10-12 — see
+`docs/DEVLOG.md` "### 2026-10-12 (late)"), parms `cvx8897`, `avm_audio`
+(bool, default off), `avm_audio_index`, `avm_audio_id`,
+`softdep: pre: snd-pcm`, 4×2 MB URBs.  `fix-driver.sh` expects this
+srcversion and prints the `rmmod -f` escape hatch if an old build's stray
+ref survives unbind.
 
 ## 10. Do / don't
 

@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # fix-driver.sh - one-shot clean reload of the avmcv710 kernel driver.
 #
-# Why this exists: the old module registered the AVMCV710 ALSA capture card,
-# and a registered snd card pins its module, so a plain `rmmod avmcv710`
-# fails with "Module avmcv710 is in use" even with no program holding the
-# device open.  This script unbinds the USB interface first (which runs the
-# driver's disconnect -> frees the ALSA card -> drops the pin), then unloads
-# and loads the freshly installed module.
+# Why this exists: a registered AVMCV710 ALSA capture card pins its module,
+# so a plain `rmmod avmcv710` fails with "Module avmcv710 is in use" even
+# when nothing holds the device open.  The fixed build drops the card pin in
+# disconnect(), so unbinding the USB interface first is enough to unload.
+# The old (pre-fix) build does NOT do that; if it is still what is loaded on
+# this host, the script now tells you the safe escape hatch instead of
+# giving up silently.
 #
 # The replacement module registers no sound card by default (audio is opt-in,
 # avm_audio=1), so this script is also the way to do a clean reload whenever
@@ -18,13 +19,24 @@ set -u
 
 MOD="avmcv710"
 DRV="/sys/bus/usb/drivers/$MOD"
-EXPECTED_SRC="F8A0D1FB8A2BD916237B40C"   # module with the ops->prepare fix
+EXPECTED_SRC="47D0A3D5A3B5820DE03EF7B"   # bug-hunt fixes (see docs/DEVLOG.md 2026-10-12)
 
 [ "$(id -u)" -eq 0 ] || { echo "run as root (sudo ./fix-driver.sh)"; exit 1; }
 
 fail() { echo "FAIL: $*"; exit 1; }
 
-# --- 1. locate the bound CV710 interface (USB 07ca:0710, one interface) ----
+# --- 1. close OBS first, unconditionally ---------------------------------
+# OBS retries its capture source, so it can grab /dev/video0 in the gap
+# between "check who holds it" and "unbind" - and an open fd keeps the video
+# device alive, deferring the vdev release (and thus, on the OLD build, the
+# module pin).  Kill it up front so unbind+rmmod have a stable window.
+if pgrep -x obs >/dev/null; then
+	echo "closing obs (it retries the capture source and can grab /dev/video0 mid-unbind)..."
+	pkill -TERM -x obs || true; sleep 2
+	pgrep -x obs >/dev/null && { echo "obs did not exit; force-killing"; pkill -KILL -x obs || true; sleep 1; }
+fi
+
+# --- 2. locate the bound CV710 interface (USB 07ca:0710, one interface) ----
 intf=""
 for i in /sys/bus/usb/devices/*/*:1.0; do
 	[ -d "$i" ] || continue
@@ -34,34 +46,43 @@ for i in /sys/bus/usb/devices/*/*:1.0; do
 done
 [ -n "$intf" ] && echo "found interface $intf bound to $MOD" || echo "note: no interface is bound to $MOD today"
 
-# --- 2. close whatever holds /dev/video0 (OBS retries its source) ----------
-if fuser /dev/video0 >/dev/null 2>&1; then
-	echo "--- /dev/video0 is held by:"
-	fuser -v /dev/video0 2>&1 || true
-	if pgrep -x obs >/dev/null; then
-		echo "closing obs (it owns the capture device)..."
-		pkill -TERM -x obs || true; sleep 2
-		pgrep -x obs >/dev/null && { echo "obs did not exit; force-killing"; pkill -KILL -x obs || true; sleep 1; }
-	else
-		fail "a process other than obs holds /dev/video0 - close it and re-run"
-	fi
-fi
-
-# --- 3. unbind -> disconnect frees the ALSA card (drops the module pin) ----
+# --- 3. unbind -> disconnect drops the ALSA card pin (fixed build) ---------
 if [ -n "$intf" ] && [ -w "$DRV/unbind" ]; then
 	echo "unbinding $intf (disconnect frees the AVMCV710 sound card)..."
 	echo "$intf" > "$DRV/unbind" || fail "unbind of $intf failed"
-	sleep 1
+	sleep 2
 fi
 
-# --- 4. unload the old module (retry briefly for stray refs) ---------------
+# --- 4. unload the old module ----------------------------------------------
+# With the fixed build the pin is gone as soon as disconnect runs; with the
+# old build a stray ref can linger invisibly (no open fds, no card node) and
+# plain rmmod keeps failing.  Show the refcount each try so the drift is
+# visible, and if it is stuck, hand the user the deliberate force-unload.
 echo "unloading $MOD..."
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-	lsmod | grep -q "^$MOD " || break
-	rmmod "$MOD" 2>/dev/null && break
+ref_prev=""
+for n in $(seq 1 20); do
+	lsmod | grep -q "^$MOD " || { echo "module already gone"; break; }
+	ref="$(cat /sys/module/$MOD/refcnt 2>/dev/null || echo '?')"
+	[ "$ref" != "$ref_prev" ] && echo "  refcnt=$ref (attempt $n/20)"
+	ref_prev="$ref"
+	rmmod "$MOD" 2>/dev/null && { echo "rmmod ok"; break; }
 	sleep 1
 done
-lsmod | grep -q "^$MOD " && fail "rmmod $MOD still fails (module in use) - see fuser output above"
+
+if lsmod | grep -q "^$MOD "; then
+	ref="$(cat /sys/module/$MOD/refcnt 2>/dev/null || echo '?')"
+	echo "---"
+	echo "rmmod still fails: module avmcv710 is loaded with refcnt=$ref."
+	echo "Video node and sound card are already gone; the remaining ref is"
+	echo "an internal leak of the OLD loaded build.  Verify nothing holds the"
+	echo "device, then force-unload DELIBERATELY and load the fixed build:"
+	echo
+	echo "  sudo rmmod -f avmcv710 && sudo modprobe avmcv710 $*"
+	echo
+	echo "Do NOT force-unload while OBS/PipeWire are running or while a"
+	echo "capture is in progress."
+	exit 1
+fi
 
 # --- 5. load the freshly installed module (audio off unless asked) ---------
 echo "loading $MOD $* ..."

@@ -72,6 +72,7 @@ Not yet parity (see TODO):
 | Content-protection overlay | yes | same (HDCP doc only) | 🟡 doc |
 | Receiver status (lock/RGB/rate) | ~10 Hz poll | 10 Hz poll while streaming → `dev->sig` | ✅ (test pending) |
 | Warm restart without replug | yes | **no (open bug)** | 🔴 TODO-4 |
+| Clean unload (rmmod without replug) | n/a | unbind drops the ALSA pin in disconnect; rmmod succeeds | ✅ (fixed 2026-10-12) |
 | EDID upload / HPD handshake on start | yes (every open) | yes (in 871-cmd trace, 0x50 ×N) | ✅ |
 | EP1 wedge recovery | drain + stall service | drain + toggle reset + retry | ✅ |
 
@@ -197,6 +198,88 @@ Fix (`avmcv710-audio.c`):
   `avm_audio_push()` already no-ops on `dev->audio == NULL`; `fini()` on
   `NULL` is a guard early-return.  `avm_audio_index`/`avm_audio_id` are inert
   while disabled.
+
+### 2026-10-12 (late) — full driver bug hunt: 8 confirmed bugs, fixes landed
+
+Directive: "go hunt for all problems in the driver."  The recovery pass for
+the ALSA oops surfaced a *second* unload defect, then the audit found six
+more.  All eight fixed in this session (see module identity
+`47D0A3D5A3B5820DE03EF7B`).
+
+**Unload/pin bugs (the reason `rmmod` kept failing):**
+
+1. **`avm_usb_disconnect()` never freed the ALSA card.**  `avm_audio_fini()`
+   only ran from `avm_vdev_release()` (fired on the *last video-node fd
+   close*), so an unbind that merely unregistered the video node left the
+   registered snd card pinning the module — `rmmod` failed with no way out.
+   The old build freed the card in disconnect (why the card vanished on the
+   user's unbind while the module stayed pinned by a stray ref).  Fix:
+   `avm_audio_fini()` in disconnect, after the parser flush (no in-flight
+   0x58 push can race `a->dying`); a still-open arecord keeps the card (and
+   module) alive via `snd_card_free_when_closed` — the correct contract.
+2. **`usb_set_intfdata(intf, dev)` before the fallible steps.**  A probe
+   failure after that left intfdata pointing at a freed `dev`; the affected
+   error path (or a later unbind) would dereference it.  Fix: set intfdata
+   only after every fallible step succeeded (nothing before it reads it).
+3. **`avm_init_urbs` fail loop leaked the failing index's 2 MB `parse_buf`.**
+   `while (i--)` freed indices `i-1..0`, skipping `i` — the entry whose
+   `kmalloc`/`usb_alloc_urb` just failed (parse_buf allocated, urb NULL).
+   Fix: `for (; i >= 0; i--)`, inclusive.
+4. **`avm_status_fini()` cancelled a zeroed `status_work` on pre-init probe
+   failures** (bootstrap/CVX failing before `avm_status_init`).  With
+   `CONFIG_DEBUG_OBJECTS_WORK` that is a WARN on a kzalloc'd work struct.
+   Fix: `dev->status_inited` set in init, early-return in fini.
+
+**Data-path races (kernel-safety contract):**
+
+5. **Adaptive-mode frames were always dropped.**  `avm_detect_mode()`'s two
+   tolerant branches accepted a frame within ±2% of the measurement but set
+   `m->target = expected`; the CV-23 exact-size gate then compared
+   `frame_words != mode->target` against the observed count, which almost
+   never equals `expected` for a non-table timing → every 1366x768 /
+   1280x1024 / VGA-style source hit `corrupt+drop` and was never delivered.
+   Fix: the tolerant branches set `m->target = words` (the exact-derivation
+   interlaced branch is already `target == words` by construction).  Frame
+   accumulation is clamped to `AVM_MAX_FRAME_WORDS`, so an oversized
+   adaptive geometry degrades to a drop, never an overrun.
+6. **`p->frame_sequence++` data race.**  Parser worker and status (splash)
+   worker both deliver through `dev->vb_bufs`; the increment lived outside
+   the `urbs_lock` critical section that pops the buffer → two concurrent
+   delivers could stamp duplicate sequence numbers on DQBUF frames.  Fix:
+   advance inside the `if (buf)` lock region.
+7. **Global `static struct avm_mode avm_meas_mode` raced across adapters.**
+   Two CV710s on one host shared one scratch mode, so a concurrent frame on
+   the other adapter could corrupt a mode before `avm_handle_frame_end()`
+   gated on it.  Fix: per-device `dev->parser.meas`.
+8. **Plain writes to `active_w/h/interlaced/mode_serial` vs READ_ONCE
+   readers.**  `avm_live_geometry()` (ioctl) and the cvx8897 worker read
+   these with READ_ONCE (runs on other CPUs); the parser published them with
+   plain stores.  Fix: WRITE_ONCE on the publishes (and READ_ONCE on the
+   hysteresis comparison).
+
+**Hardening (latent, no current trigger):**
+
+9. `avm_bootstrap()` fed the 2048-byte scratch with `c->len` unbounded; a
+   regenerated trace with an oversized write/read entry would overrun it
+   (today's table max is 512).  Fix: WARN+`-EINVAL` guard before dispatch.
+10. **Audio UAF window:** `avm_audio_push()` copies into `rt->dma_area`
+    under `a->lock`, but nothing serialized against the core freeing that
+    buffer on app close (`snd_pcm_hw_free` runs outside our lock).  Fix:
+    `avm_audio_pcm_hw_free()` taking `a->lock` as a barrier — the buffer
+    cannot be freed while a push is mid-memcpy.
+
+**Left alone (reported, not changed):** the C1 clock-recovery branch consumes
+2 of its 3 trailer words without a parity check against the userspace code;
+the `frame_words >= 40000` arbitrary floor; the adaptive-interlaced
+`> stride*field_lines` weave drop.  All are conservative (drop-only) and
+the userspace port has the same shape.
+
+**Recovery tooling:** `fix-driver.sh` now kills OBS *before* unbinding
+(OBS retries its source and can grab /dev/video0 mid-flight, deferring the
+vdev release), prints `/sys/module/avmcv710/refcnt` while retrying rmmod,
+and — when the old build's invisible stray ref survives — prints the
+deliberate `sudo rmmod -f avmcv710 && sudo modprobe avmcv710` escape hatch
+instead of failing silently.
 
 ### 2026-10-11 — `.inf` "device parameter" keys ruled out
 

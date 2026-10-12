@@ -24,9 +24,11 @@
  * full period, so the PCM is marked non-atomic.
  *
  * Lifecycle: avm_audio_init() runs at probe (failure is non-fatal: video
- * still works without audio).  The struct is owned by the snd_card
- * (private_free), so a still-open arecord survives disconnect; fini() only
- * flags the card as dying and calls snd_card_free_when_closed().
+ * still works without audio).  Registration is opt-in: the `avm_audio`
+ * module param (default 0) gates the whole card - without it the module is
+ * video-only, which is the previously stable state.  The struct is owned by
+ * the snd_card (private_free), so a still-open arecord survives disconnect;
+ * fini() only flags the card as dying and calls snd_card_free_when_closed().
  */
 #include <linux/module.h>
 #include <linux/slab.h>
@@ -46,6 +48,9 @@ MODULE_SOFTDEP("pre: snd-pcm");
 #define AVM_AUDIO_RING_BYTES	(1u << 20) /* PCM buffer max: ~5.5 s @ 48k */
 #define AVM_AUDIO_PERIOD_MIN	1920	/* 10 ms @ 48k/2ch/S16LE */
 
+static bool avm_audio;		/* opt-in: card registration OFF until hardware-verified */
+module_param(avm_audio, bool, 0444);
+MODULE_PARM_DESC(avm_audio, "Register the AVMCV710 ALSA capture card at probe (default 0=off; pass avm_audio=1)");
 static int avm_audio_index = -1;	/* snd-card index, -1 = auto */
 static char *avm_audio_id = "AVMCV710";
 module_param(avm_audio_index, int, 0444);
@@ -142,6 +147,23 @@ static int avm_audio_pcm_hw_params(struct snd_pcm_substream *subs,
 	return 0;
 }
 
+static int avm_audio_pcm_prepare(struct snd_pcm_substream *subs)
+{
+	/*
+	 * Mandatory, not optional: snd_pcm_do_prepare() calls
+	 * ops->prepare() without a NULL check (sound/core/pcm_native.c).
+	 * A NULL op here is an instruction fetch at RIP 0x0 - exactly the
+	 * oops WirePlumber hit the moment the card registered (it opens +
+	 * PREPAREs every capture PCM to enumerate it), which then killed
+	 * the whole audio graph minutes later.
+	 *
+	 * Everything the sink needs is pinned by the constraint set and
+	 * re-checked in hw_params; the push path re-validates the runtime
+	 * on every packet.  Nothing left to do but exist.
+	 */
+	return 0;
+}
+
 static int avm_audio_pcm_trigger(struct snd_pcm_substream *subs, int cmd)
 {
 	struct avm_audio *a = snd_pcm_substream_chip(subs);
@@ -188,6 +210,7 @@ static const struct snd_pcm_ops avm_audio_ops = {
 	.open		= avm_audio_pcm_open,
 	.close		= avm_audio_pcm_close,
 	.hw_params	= avm_audio_pcm_hw_params,
+	.prepare	= avm_audio_pcm_prepare,
 	.trigger	= avm_audio_pcm_trigger,
 	.pointer	= avm_audio_pcm_pointer,
 };
@@ -272,6 +295,19 @@ int avm_audio_init(struct avm_device *dev)
 	struct snd_pcm *pcm;
 	struct avm_audio *a;
 	int ret;
+
+	/*
+	 * Opt-in (default off).  The card registration used to run at every
+	 * probe and its PCM oopsed userspace on PREPARE (missing ops->prepare,
+	 * fixed above) - enough to take down the whole audio stack.  Until the
+	 * sink is verified on hardware the module stays video-only, exactly
+	 * the stable state it had before TODO-1, unless avm_audio=1 is passed.
+	 */
+	if (!avm_audio) {
+		dev_info(&dev->udev->dev,
+			 "ALSA capture PCM disabled (avm_audio=0); pass avm_audio=1 to opt in\n");
+		return 0;
+	}
 
 	a = kzalloc(sizeof(*a), GFP_KERNEL);
 	if (!a)

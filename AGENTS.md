@@ -20,11 +20,16 @@ guesses.
 
 **The driver is feature-complete for video/audio/hardware-conversion.**  The
 last three tickets (TODO-1 audio, TODO-2 ADV7604 poll, TODO-3 overlays) are
-written and committed; they have **not yet been installed and tested by the
-user** (the agent cannot `sudo`).  TODO-4 (soft-reload auto-recovery) is
-waiting on a user-run experiment.  The next agent's job is **coordinate the
-verification, then implement TODO-4 based on the experiment result** — not to
-rewrite anything.
+written and committed.  The first install of TODO-2/3's module oopsed the
+kernel through the never-hardware-tested ALSA card (TODO-1): the PCM had no
+`ops->prepare`, this kernel calls it unconditionally, and WirePlumber's
+prepare of the new card was a NULL instruction fetch that collapsed system
+audio.  That is **fixed and committed** and audio is now opt-in
+(`avm_audio=1`, default off = the previously stable video-only module); the
+user still must verify TODO-1/2/3 on hardware (the agent cannot `sudo`).
+TODO-4 (soft-reload auto-recovery) is waiting on a user-run experiment.  The
+next agent's job is **coordinate the verification, then implement TODO-4
+based on the experiment result** — not to rewrite anything.
 
 ## 1. Where everything lives
 
@@ -75,18 +80,29 @@ journalctl -k -f          # kernel ring buffer (dmesg is NOT readable)
 
 Kernel: `7.2.6-1-cachyos` (CachyOS), full build tree at
 `/lib/modules/$(uname -r)/build`.  Module params: `cvx8897` (int, writable
-runtime, 0=off/1=follow s_parm), `avm_audio_index` (int, -1=auto),
-`avm_audio_id` (charp, "AVMCV710").  `softdep: pre: snd-pcm`.
+runtime, 0=off/1=follow s_parm), `avm_audio` (bool, 0=off **default**,
+1=register the ALSA card at probe — opt-in until hardware-verified),
+`avm_audio_index` (int, -1=auto), `avm_audio_id` (charp, "AVMCV710").
+`softdep: pre: snd-pcm`.
 
 ## 3. Pending user verification (do this FIRST, it gates everything)
 
-Three features are built and committed but **never installed**:
+Three features are built and committed but **none verified on hardware**:
+TODO-1's first install hit the audio oops (now fixed, opt-in); TODO-2/3 were
+never exercised in the broken session.
 
-1. **TODO-1 ALSA audio** (`aa16708`) — later than every previous test round.
+1. **TODO-1 ALSA audio** (`aa16708` + regression fix) — **opt-in: reload with
+   `avm_audio=1`** or the card is not registered (default).  The first install
+   oopsed the kernel (missing `ops->prepare`; see devlog) and collapsed the
+   audio stack — the fix is committed.  Normal (non-opt-in) use must
+   **not** be affected: `/proc/asound/cards` lists PCH (and AVMCV710 only
+   with `avm_audio=1`), PipeWire/audio keep working.
    ```bash
+   sudo modprobe -r avmcv710 && sudo modprobe avmcv710 avm_audio=1
    arecord -D hw:CARD=AVMCV710 -f S16_LE -r 48000 -c 2 -d 10 /tmp/a.wav
    cat /proc/asound/cards   # must list AVMCV710
-   # then: OBS records video+audio; /tmp/a.wav plays back in sync
+   # then: OBS records video+audio; /tmp/a.wav plays back in sync;
+   # the rest of the system keeps producing audio (no WirePlumber collapse)
    ```
 2. **TODO-2 ADV7604 poll + TODO-3 overlays** (`482fed3` + `7ebb4b6`) — start
    OBS capture and watch `journalctl -k -f`:
@@ -192,10 +208,15 @@ Decision tree (implement based ONLY on the result):
   limited-range black raster at the live geometry and delivers it through the
   normal vb2 path.  (The vendor draws its splash host-side; a bare V4L2 node
   synthesizes it instead — documented divergence.)
-- **Audio (TODO-1):** snd-usb-audio push model — parser copies 0x58 payload
-  into the PCM DMA buffer, `pointer()` reports the write cursor, PCM flagged
-  non-atomic, `snd_pcm_period_elapsed` fired from the parser worker.  Fixed
-  S16LE stereo 48 kHz; Audio Infoframe rate parse is an open follow-up.
+- **Audio (TODO-1), opt-in `avm_audio=1`:** snd-usb-audio push model — parser
+  copies 0x58 payload into the PCM DMA buffer, `pointer()` reports the write
+  cursor, PCM flagged non-atomic, `snd_pcm_period_elapsed` fired from the
+  parser worker.  Fixed S16LE stereo 48 kHz.  **Registration is off by
+  default** (the card's missing `ops->prepare` oopsed this kernel — it calls
+  prepare unconditionally — and collapsed the user's audio stack on first
+  install; now provided).  The core maps the vmalloc PCM buffer itself, so
+  no `.mmap`/`.page` ops and no vmalloc-helper imports.  Audio Infoframe
+  rate parse is an open follow-up.
 - **Converter (CVX8897):** opt-in `cvx8897=1`.  `avm_cvx8897_half_rate()` maps
   (w,h,fps) to a table; 1080p→60:30/50:25, 720p→same, other geometries
   60→30 only; canned for interlaced.  Programs I2C 7-bit 0x18 + PCA9539
@@ -239,7 +260,7 @@ Decision tree (implement based ONLY on the result):
 
 | # | Ticket | State |
 |---|--------|-------|
-| TODO-1 | ALSA capture PCM | built + committed `aa16708` — **user test pending** |
+| TODO-1 | ALSA capture PCM | built + committed `aa16708` + oops fix (opt-in `avm_audio=1`) — **user test pending** |
 | TODO-2 | ADV7604 status poll | built + committed `482fed3`,`7ebb4b6` — **user test pending** |
 | TODO-3 | No-signal/out-of-range overlays | built + committed `482fed3` — **user test pending** |
 | TODO-4 | Soft-reload no output | **open** — needs user `authorized`-toggle experiment, then implement decision per §4 |
@@ -249,7 +270,8 @@ Decision tree (implement based ONLY on the result):
 | — | Suspend/resume safe audio | open (P2) |
 
 Current module identity (for regression diffing): `srcversion
-305B19C640B1F21123A98F3` (after TODO-2/3 + telemetry), parms `cvx8897`,
+F8A0D1FB8A2BD916237B40C` (after TODO-2/3 + telemetry + ALSA `.prepare`
+fix/opt-in), parms `cvx8897`, `avm_audio` (bool, default off),
 `avm_audio_index`, `avm_audio_id`, `softdep: pre: snd-pcm`, 4×2 MB URBs.
 
 ## 10. Do / don't

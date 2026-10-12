@@ -22,10 +22,16 @@ Working and user-confirmed:
 - Frame rate conversion (CVX8897), opt-in via `cvx8897=1`
 - STREAMON no-data watchdog (soft-reload diagnosis)
 - `measured_fps` no longer reports 61 for a 60 Hz source
-- ALSA capture PCM (TODO-1): parser pushes 0x58 audio straight into the
-  PCM DMA buffer (snd-usb-audio model), card id `AVMCV710`
 
 Built, awaiting user install/test:
+- **ALSA capture PCM (TODO-1), opt-in** — parser pushes the 0x58 audio
+  payload straight into the PCM DMA buffer (snd-usb-audio model), card id
+  `AVMCV710`.  **Registration is disabled by default (`avm_audio=0`).**  The
+  first hardware install of the card oopsed the kernel: WirePlumber's PREPARE
+  of the new PCM hit a NULL `ops->prepare` (this kernel calls it
+  unconditionally), RIP 0x0, and the audio graph collapsed minutes later.
+  Root-caused and fixed (dated entry below); the card stays opt-in until the
+  sink is verified on hardware.
 - ADV7604 status poll (TODO-2): 10 Hz while streaming, publishes `dev->sig`
   (TMDS lock / interlace / measured geometry)
 - No-signal + out-of-range overlays (TODO-3): 640×480 bitmap composited into
@@ -38,11 +44,17 @@ Not yet parity (see TODO):
 - Converter RGB-vs-422 choice still assumes YCbCr 4:2:2 (needs AVI colorspace
   flag read)
 
-> Handoff 2026-10-12 (end of session): agent stepped back until the user has
-> installed + tested TODO-1/2/3 (J/K/L in the matrix) and run the TODO-4
-> USB `authorized`-toggle experiment.  A new agent should read
-> `docs/AGENTS.md` first — it is the full handoff (state, commands, RE facts,
-> pitfalls, next steps).
+> Handoff 2026-10-12 (evening): the first install of TODO-1/2/3 oopsed the
+> kernel through the never-hardware-tested ALSA card — the PCM had no
+> `ops->prepare`, this kernel calls it unconditionally, so WirePlumber's
+> PREPARE of the new card was a NULL instruction fetch (RIP 0x0) and the
+> whole audio graph collapsed minutes later ("videos stopped", OBS balked).
+> Root cause fixed (dated entry below) and the card is now
+> opt-in: `avm_audio=1`, default off (video-only, the previously stable
+> state).  Next: user reinstalls + reloads, confirms OBS/video/audio are
+> back to normal, then opts into the audio test.  TODO-2/3 and the TODO-4
+> `authorized`-toggle experiment are unchanged.  Read `docs/AGENTS.md` for
+> the full handoff.
 
 ---
 
@@ -54,7 +66,7 @@ Not yet parity (see TODO):
 | Geometry resets passthrough | yes (Scaler off by default) | yes (never scales) | ✅ |
 | Res/fps change without restart | yes | yes (V4L2_EVENT_SOURCE_CHANGE) | ✅ |
 | "Video Input Frame Rate" 60/50/30/25 | CVX8897 | CVX8897, opt-in | ✅ |
-| Audio S16LE stereo @ 48 kHz | yes (PCM) | ALSA capture PCM (`avmcv710-audio.c`) | ✅ (test pending) |
+| Audio S16LE stereo @ 48 kHz | yes (PCM) | ALSA capture PCM (`avmcv710-audio.c`), opt-in `avm_audio=1` | ✅ (test pending, opt-in) |
 | No-signal overlay | yes (BMP splice) | 640×480 BMP composited at live geometry | ✅ (test pending) |
 | Out-of-range overlay | yes | same | ✅ (test pending) |
 | Content-protection overlay | yes | same (HDCP doc only) | 🟡 doc |
@@ -142,6 +154,50 @@ reconciled it with the current tree (audio + cvx live, watchdog live, URBs
   `measured_fps`/`active_interlaced`.  The RGB-vs-422 table choice remains
   the one poll-driven follow-up.
 
+### 2026-10-12 (PM) — ALSA card oops: mandatory `ops->prepare` + opt-in gate
+
+Symptom: after installing the TODO-1/2/3 module, "everything broken" —
+OBS balked, videos stopped playing, user had to restart PipeWire.  Journal
+evidence: probe was clean (`registered video0`, `ALSA capture PCM
+registered`, `ready, 4 x 2080768 byte URBs`), then immediately:
+
+```
+BUG: kernel NULL pointer dereference, address: 0000000000000000
+#PF: supervisor instruction fetch in kernel mode
+RIP: 0010:0x0
+... Comm: wireplumber ...
+snd_pcm_do_prepare+0x72 ... snd_pcm_action_nonatomic+0x98 ...
+```
+
+~4 min later WirePlumber died in `stop-sigterm` (killed) — the audio stack
+collapse behind the user-visible breakage.
+
+Root cause: **`snd_pcm_do_prepare()` calls `substream->ops->prepare()`
+unconditionally** in this kernel (no NULL check — confirmed against
+`sound/core/pcm_native.c`).  `avm_audio_ops` had no `.prepare`, so
+WirePlumber's open+prep of the new capture PCM (it prepares every device to
+enumerate it) executed a NULL function pointer: supervisor instruction fetch
+at 0x0.  The old NULL-checked variant of that helper is long gone, which is
+why the audio TODO shipped a latent oops.
+
+Fix (`avmcv710-audio.c`):
+- Added `avm_audio_pcm_prepare()` (returns 0 — hw_params pins the format and
+  the push path per-packet validates the runtime), wired as `.prepare`.
+- Audited every other `ops->` call in `snd_pcm_do_*`: `snd_pcm_do_start`/
+  `snd_pcm_do_stop` need `.trigger` (we have it); `snd_pcm_ops_ioctl` falls
+  back to `snd_pcm_lib_ioctl`; `.mmap`/`.page` are optional — for
+  `SNDRV_DMA_TYPE_VMALLOC` buffers `hw_support_mmap()` returns true and the
+  data area is mapped by the core via memalloc' `snd_dma_vmalloc_ops` (no
+  driver op needed, and the old `snd_pcm_lib_mmap_vmalloc` exports are gone
+  from pcm_memory.c — do not import them).
+- Registration is now **opt-in**: `avm_audio=1` module param, **default 0**
+  (off).  With it off the module is exactly the previously stable video-only
+  card, and nothing about the sink can affect userspace until it is
+  deliberately enabled and verified (same policy as `cvx8897`).
+  `avm_audio_push()` already no-ops on `dev->audio == NULL`; `fini()` on
+  `NULL` is a guard early-return.  `avm_audio_index`/`avm_audio_id` are inert
+  while disabled.
+
 ### 2026-10-11 — `.inf` "device parameter" keys ruled out
 
 `avmu3c877_x64.inf` service params (`ENABLE_SCALER=1`, `SCALER_OP_MODE=2`,
@@ -185,12 +241,19 @@ tuning) — **not FX3/EP1 commands**.  Nothing to port to the kernel.
   `pointer()` reports the write cursor, so mmap and RW both work with no
   `copy_user` op; `snd_pcm_period_elapsed` is fired from the parser worker
   (PCM marked non-atomic).  Card id `AVMCV710`, S16LE stereo 48 kHz, 1 MB max
-  buffer, `index`/`id` module params, `MODULE_SOFTDEP("pre: snd-pcm")`.
+  buffer, `index`/`id`/`avm_audio` module params,
+  `MODULE_SOFTDEP("pre: snd-pcm")`.
   Audio init is non-fatal (video-only fallback on failure).
-  Test: `arecord -D hw:CARD=AVMCV710 -f S16_LE -r 48000 -c 2 -d 10 /tmp/a.wav`
-  while OBS records; `/proc/asound/cards` should list AVMCV710.
-  Open follow-up: sample rate is fixed 48 kHz; parse the Audio Infoframe
-  (0x34/0x18 bit 0 + infoframe byte 1 bits 4:2) to honour 32/44.1 kHz sources.
+  **2026-10-12 regression:** first hardware install oopsed (`ops->prepare`
+  NULL, see dated entry) and collapsed system audio.  Fixed + the card is now
+  **opt-in via `avm_audio=1`, default off** — a reload without the param is
+  the known-stable video-only module.  Acceptance: with `avm_audio=1`,
+  `arecord -D hw:CARD=AVMCV710 -f S16_LE -r 48000 -c 2 -d 10 /tmp/a.wav`
+  while OBS records (`/proc/asound/cards` lists AVMCV710), **and** the rest of
+  the system keeps producing sound (no WirePlumber collapse).  Open
+  follow-up: sample rate is fixed 48 kHz; parse the Audio Infoframe
+  (0x34/0x18 bit 0 + infoframe byte 1 bits 4:2) to honour 32/44.1 kHz
+  sources.
 - [ ] **TODO-4 soft-reload no output** — close the loop with the USB-reset
   hypothesis; keep the watchdog as the tripwire.  Acceptance: rmmod/modprobe
   then start OBS capture without replugging — frames arrive.

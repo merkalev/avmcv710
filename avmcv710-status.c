@@ -91,6 +91,7 @@ static void avm_poll_signal(struct avm_device *dev)
 	struct avm_signal sig;
 	u8 io_lock = 0, io_flags = 0;
 	u8 wb[2] = { 0, 0 }, hb[2] = { 0, 0 };
+	bool lock_change, prev_locked;
 	unsigned long flags;
 	int fails = 0;
 
@@ -116,8 +117,21 @@ static void avm_poll_signal(struct avm_device *dev)
 	sig.interlaced = (io_flags & 0x10) != 0;
 	sig.w = ((wb[0] & 0x0F) << 8) | wb[1];
 	sig.h = ((hb[0] & 0x0F) << 8) | hb[1];
+
+	/* one-shot telemetry on lock transitions, so the poll is visible in
+	 * the kernel log without spamming every 100 ms (logged after the
+	 * spinlock is dropped - printk should not run IRQ-disabled) */
+	prev_locked = dev->sig.valid && dev->sig.tmds_locked;
+	lock_change = prev_locked != sig.tmds_locked;
+
 	dev->sig = sig;
 	spin_unlock_irqrestore(&dev->sig_lock, flags);
+
+	if (lock_change && sig.tmds_locked)
+		dev_info(&dev->udev->dev, "signal: TMDS locked %ux%u%s\n",
+			 sig.w, sig.h, sig.interlaced ? " (interlaced)" : "");
+	else if (lock_change && !sig.tmds_locked)
+		dev_info(&dev->udev->dev, "signal: TMDS lost\n");
 }
 
 /* Does the measured geometry produce stageable, deliverable frames? */

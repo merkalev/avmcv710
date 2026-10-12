@@ -35,6 +35,9 @@
 #include <media/videobuf2-v4l2.h>
 #include <media/videobuf2-vmalloc.h>
 
+/* ALSA capture PCM object, defined in avmcv710-audio.c */
+struct avm_audio;
+
 /* USB identity */
 #define AVM_USB_VID		0x07ca
 #define AVM_USB_PID		0x0710
@@ -179,6 +182,11 @@ struct avm_device {
 	spinlock_t sig_lock;		/* protects dev->sig */
 	struct avm_signal sig;
 
+	/* ALSA capture PCM (avmcv710-audio.c): the parser pushes 0x58 audio
+	 * payload bytes into the PCM DMA buffer.  NULL until probe registers
+	 * it and after fini, so every reader lives behind READ_ONCE. */
+	struct avm_audio *audio;
+
 	/* USB plumbing */
 	struct usb_anchor urb_anchor;	/* anchored streaming URBs */
 	bool bootstrapped;
@@ -236,5 +244,10 @@ void avm_usb_release(struct avm_device *dev);
 void avm_parser_reset(struct avm_device *dev);
 void avm_parser_feed(struct avm_device *dev, u32 *d, u32 count);
 void avm_deliver_frame(struct avm_device *dev, const u8 *src, u32 words);
+
+/* avmcv710-audio.c */
+int avm_audio_init(struct avm_device *dev);
+void avm_audio_fini(struct avm_device *dev);
+void avm_audio_push(struct avm_device *dev, const u8 *src, u32 bytes);
 
 #endif /* AVM_CV710_H */

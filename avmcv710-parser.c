@@ -13,9 +13,9 @@
  *   - frame word counts are gated: a frame whose size does not match the
  *     locked mode geometry is dropped, never padded or presented skewed
  *     (CV-23 rule)
- *   - audio packets are parsed and skipped so the video raster stays
- *     aligned; there is no ALSA sink yet (future work), audio bytes are
- *     counted and discarded
+ *   - audio packets are demuxed so the video raster stays aligned and their
+ *     payload is handed to the ALSA capture PCM (avmcv710-audio.c); with no
+ *     capture client open the bytes are simply dropped
  *   - markers that straddle a transfer boundary are held back and prepended
  *     to the next chunk (max 3 words), preserving cross-chunk correctness
  */
@@ -518,12 +518,14 @@ void avm_parser_feed(struct avm_device *dev, u32 *d, u32 count)
 		p->hold_n = 0;
 	}
 
-	/* Audio continuation across a chunk boundary (payload skipped). */
+	/* Audio continuation across a chunk boundary: keep feeding the PCM. */
 	if (p->in_audio) {
+		u32 start = i;
 		u32 take = min_t(u32, p->remaining_audio_words, count);
 
 		i += take;
 		p->remaining_audio_words -= take;
+		avm_audio_push(dev, (const u8 *)(d + start), take * 4);
 		if (p->remaining_audio_words == 0) {
 			/* payload complete: back to padding, then markers */
 			p->in_audio = false;
@@ -691,10 +693,17 @@ void avm_parser_feed(struct avm_device *dev, u32 *d, u32 count)
 
 				i += 2;
 				if (avail >= audio_words) {
+					avm_audio_push(dev,
+						(const u8 *)(d + i),
+						audio_bytes);
 					i += audio_words;
 					p->in_audio_padding = true;
 				} else {
-					/* payload spills into the next chunk */
+					/* payload spills into the next chunk:
+					 * feed the part we have, resume above */
+					avm_audio_push(dev,
+						(const u8 *)(d + i),
+						avail * 4);
 					p->in_audio = true;
 					p->remaining_audio_words =
 						audio_words - avail;

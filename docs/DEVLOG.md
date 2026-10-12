@@ -24,8 +24,6 @@ Working and user-confirmed:
 - `measured_fps` no longer reports 61 for a 60 Hz source
 
 Not yet parity (see TODO):
-- No ALSA audio capture (packets skipped, not sunk) — **spec is now fully
-  known (RE 2026-10-11)**
 - No ADV7604 status poll / overlays (WIP exists at
   `/tmp/opencode/avmcv710-status-wip.c`, uncommitted)
 - Soft-reload no-output root cause still open (watchdog confirms it happens;
@@ -41,7 +39,7 @@ Not yet parity (see TODO):
 | Geometry resets passthrough | yes (Scaler off by default) | yes (never scales) | ✅ |
 | Res/fps change without restart | yes | yes (V4L2_EVENT_SOURCE_CHANGE) | ✅ |
 | "Video Input Frame Rate" 60/50/30/25 | CVX8897 | CVX8897, opt-in | ✅ |
-| Audio S16LE stereo @ 48 kHz | yes (PCM) | — | 🔴 TODO-1 |
+| Audio S16LE stereo @ 48 kHz | yes (PCM) | ALSA capture PCM (`avmcv710-audio.c`) | ✅ (test pending) |
 | No-signal overlay | yes (BMP splice) | bmp header generated, unused | 🔴 TODO-3 |
 | Out-of-range overlay | yes | same | 🔴 TODO-3 |
 | Content-protection overlay | yes | same (HDCP doc only) | 🟡 doc |
@@ -135,12 +133,18 @@ tuning) — **not FX3/EP1 commands**.  Nothing to port to the kernel.
 
 ### P0 — official-driver behavior OBS users actually hit
 
-- [ ] **TODO-1 ALSA capture PCM (audio)** — Stage 3.  Parser: stop skipping
-  0x58 payloads; route to a ring buffer.  ALSA: `snd_pcm` capture, S16LE,
-  stereo, 48 kHz (or parsed rate), per-open, `SNDRV_PCM_INFO_BLOCK_TRANSFER`.
-  Acceptance: `arecord -D hw:CARD=AVMCV710` captures clean 48 kHz stereo
-  while OBS records video.
-  RE done: packet format fully known (2026-10-11).
+- [x] **TODO-1 ALSA capture PCM (audio)** — Stage 3.  Done in
+  `avmcv710-audio.c` (+ parser demux + Makefile): snd-usb-audio style sink —
+  the parser copies 0x58 payload bytes straight into the PCM DMA buffer and
+  `pointer()` reports the write cursor, so mmap and RW both work with no
+  `copy_user` op; `snd_pcm_period_elapsed` is fired from the parser worker
+  (PCM marked non-atomic).  Card id `AVMCV710`, S16LE stereo 48 kHz, 1 MB max
+  buffer, `index`/`id` module params, `MODULE_SOFTDEP("pre: snd-pcm")`.
+  Audio init is non-fatal (video-only fallback on failure).
+  Test: `arecord -D hw:CARD=AVMCV710 -f S16_LE -r 48000 -c 2 -d 10 /tmp/a.wav`
+  while OBS records; `/proc/asound/cards` should list AVMCV710.
+  Open follow-up: sample rate is fixed 48 kHz; parse the Audio Infoframe in
+  TODO-2 to honour 32/44.1 kHz sources.
 - [ ] **TODO-4 soft-reload no output** — close the loop with the USB-reset
   hypothesis; keep the watchdog as the tripwire.  Acceptance: rmmod/modprobe
   then start OBS capture without replugging — frames arrive.

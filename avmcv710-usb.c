@@ -72,6 +72,7 @@ void avm_return_buffers(struct avm_device *dev, enum vb2_buffer_state state)
  * every open file handle on the video node has been closed. */
 void avm_usb_release(struct avm_device *dev)
 {
+	avm_audio_fini(dev);
 	avm_cvx8897_fini(dev);
 	destroy_workqueue(dev->wq);
 	avm_free_urbs(dev);
@@ -361,6 +362,11 @@ static int avm_usb_probe(struct usb_interface *intf,
 	ret = avm_video_register(dev);
 	if (ret)
 		goto err_wq;
+
+	ret = avm_audio_init(dev);
+	if (ret)
+		dev_warn(&udev->dev,
+			 "ALSA capture unavailable, video-only (%d)\n", ret);
 
 	dev_info(&udev->dev,
 		 "AVerMedia ExtremeCap U3 (CV710) ready, %u x %u byte URBs\n",

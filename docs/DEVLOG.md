@@ -183,8 +183,8 @@ tuning) — **not FX3/EP1 commands**.  Nothing to port to the kernel.
   Audio init is non-fatal (video-only fallback on failure).
   Test: `arecord -D hw:CARD=AVMCV710 -f S16_LE -r 48000 -c 2 -d 10 /tmp/a.wav`
   while OBS records; `/proc/asound/cards` should list AVMCV710.
-  Open follow-up: sample rate is fixed 48 kHz; parse the Audio Infoframe in
-  TODO-2 to honour 32/44.1 kHz sources.
+  Open follow-up: sample rate is fixed 48 kHz; parse the Audio Infoframe
+  (0x34/0x18 bit 0 + infoframe byte 1 bits 4:2) to honour 32/44.1 kHz sources.
 - [ ] **TODO-4 soft-reload no output** — close the loop with the USB-reset
   hypothesis; keep the watchdog as the tripwire.  Acceptance: rmmod/modprobe
   then start OBS capture without replugging — frames arrive.
@@ -214,6 +214,9 @@ tuning) — **not FX3/EP1 commands**.  Nothing to port to the kernel.
 - [ ] Converter: read the ADV7604 AVI colorspace flag so a 720p60 RGB source
   gets the vendor's dedicated RGB table instead of the YCbCr 4:2:2 table
   (interlace + input rate are already polled/measured).
+- [ ] Audio: parse the HDMI Audio Infoframe (0x34/0x18 bit 0 + infoframe
+  payload byte 1 bits 4:2) and drive the ALSA PCM clock for 32/44.1 kHz
+  sources (PCM is currently fixed at 48 kHz).
 
 ### P2 — polish
 

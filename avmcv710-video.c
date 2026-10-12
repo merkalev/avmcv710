@@ -73,31 +73,44 @@ static int avm_enum_fmt(struct file *file, void *fh,
 /* Current detected geometry (falls back to the ADV7604 measurement before
  * the first frame locks, then 1920x1080).  Always reports the *frame*
  * geometry: the receiver may report only the field height for interlaced
- * input, so double a short (< 700) measured height. */
-static void avm_pixfmt(struct avm_device *dev, struct v4l2_pix_format *pix)
+ * input, so double a short (< 700) measured height.
+ *
+ * Shared with the overlay pump (avmcv710-status.c) so a synthesized
+ * no-signal frame is composited at exactly the geometry consumers were told
+ * to expect. */
+void avm_live_geometry(struct avm_device *dev, u32 *w, u32 *h)
 {
-	u32 w = READ_ONCE(dev->parser.active_w);
-	u32 h = READ_ONCE(dev->parser.active_h);
+	u32 ww = READ_ONCE(dev->parser.active_w);
+	u32 hh = READ_ONCE(dev->parser.active_h);
 	bool interlaced = false;
 	unsigned long flags;
 
-	if (!w || !h) {
+	if (!ww || !hh) {
 		spin_lock_irqsave(&dev->sig_lock, flags);
 		if (dev->sig.valid && dev->sig.tmds_locked &&
 		    dev->sig.w >= 320 && dev->sig.w <= 4095 &&
 		    dev->sig.h >= 120 && dev->sig.h <= 2048) {
-			w = dev->sig.w;
-			h = dev->sig.h;
+			ww = dev->sig.w;
+			hh = dev->sig.h;
 			interlaced = dev->sig.interlaced;
 		}
 		spin_unlock_irqrestore(&dev->sig_lock, flags);
 	}
-	if (!w || !h) {
-		w = 1920;
-		h = 1080;
-	} else if (interlaced && h <= 700) {
-		h *= 2;
+	if (!ww || !hh) {
+		ww = 1920;
+		hh = 1080;
+	} else if (interlaced && hh <= 700) {
+		hh *= 2;
 	}
+	*w = ww;
+	*h = hh;
+}
+
+static void avm_pixfmt(struct avm_device *dev, struct v4l2_pix_format *pix)
+{
+	u32 w, h;
+
+	avm_live_geometry(dev, &w, &h);
 
 	pix->width = w;
 	pix->height = h;
@@ -486,6 +499,11 @@ static int avm_start_streaming(struct vb2_queue *q, unsigned int count)
 			 "FPGA/DMA start command failed: %d (streaming anyway)\n",
 			 ret);
 
+	/* Now that the FPGA is producing, arm the receiver poll + overlay
+	 * pump (avmcv710-status.c).  Arming here, not in probe, is what keeps
+	 * the ADV7604 I2C off the idle link (polling an idle FX3 wedged EP1). */
+	avm_status_start(dev);
+
 	dev_dbg(&dev->udev->dev, "streaming: %u URBs submitted\n",
 		AVM_NUM_URBS);
 	return 0;
@@ -511,6 +529,11 @@ static void avm_stop_streaming(struct vb2_queue *q)
 
 	/* vb2 core holds q->lock (== stream_lock) while calling this. */
 	WRITE_ONCE(dev->streaming, false);
+
+	/* Cancel the receiver poll / overlay pump first: the worker stops
+	 * re-arming as soon as streaming clears, and this waits out any
+	 * in-flight I2C read before we park the FPGA below. */
+	avm_status_stop(dev);
 
 	/*
 	 * Park the FPGA (stop it producing frames) and reset the FX3 DMA

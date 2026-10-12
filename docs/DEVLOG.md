@@ -12,7 +12,7 @@ available to the agent).  Kernel log: `journalctl -k -f`.
 
 ---
 
-## Status (2026-10-11)
+## Status (2026-10-12)
 
 Working and user-confirmed:
 - Capture at source geometry/rate; no latency/lag (4×2 MB URBs)
@@ -22,12 +22,21 @@ Working and user-confirmed:
 - Frame rate conversion (CVX8897), opt-in via `cvx8897=1`
 - STREAMON no-data watchdog (soft-reload diagnosis)
 - `measured_fps` no longer reports 61 for a 60 Hz source
+- ALSA capture PCM (TODO-1): parser pushes 0x58 audio straight into the
+  PCM DMA buffer (snd-usb-audio model), card id `AVMCV710`
+
+Built, awaiting user install/test:
+- ADV7604 status poll (TODO-2): 10 Hz while streaming, publishes `dev->sig`
+  (TMDS lock / interlace / measured geometry)
+- No-signal + out-of-range overlays (TODO-3): 640×480 bitmap composited into
+  the current raster after an idle window, so no-signal is visible in OBS
+  at the negotiated geometry
 
 Not yet parity (see TODO):
-- No ADV7604 status poll / overlays (WIP exists at
-  `/tmp/opencode/avmcv710-status-wip.c`, uncommitted)
 - Soft-reload no-output root cause still open (watchdog confirms it happens;
   replug fixes)
+- Converter RGB-vs-422 choice still assumes YCbCr 4:2:2 (needs AVI colorspace
+  flag read)
 
 ---
 
@@ -40,10 +49,10 @@ Not yet parity (see TODO):
 | Res/fps change without restart | yes | yes (V4L2_EVENT_SOURCE_CHANGE) | ✅ |
 | "Video Input Frame Rate" 60/50/30/25 | CVX8897 | CVX8897, opt-in | ✅ |
 | Audio S16LE stereo @ 48 kHz | yes (PCM) | ALSA capture PCM (`avmcv710-audio.c`) | ✅ (test pending) |
-| No-signal overlay | yes (BMP splice) | bmp header generated, unused | 🔴 TODO-3 |
-| Out-of-range overlay | yes | same | 🔴 TODO-3 |
+| No-signal overlay | yes (BMP splice) | 640×480 BMP composited at live geometry | ✅ (test pending) |
+| Out-of-range overlay | yes | same | ✅ (test pending) |
 | Content-protection overlay | yes | same (HDCP doc only) | 🟡 doc |
-| Receiver status (lock/RGB/rate) | ~10 Hz poll | none (word-count fallback) | 🔴 TODO-2 |
+| Receiver status (lock/RGB/rate) | ~10 Hz poll | 10 Hz poll while streaming → `dev->sig` | ✅ (test pending) |
 | Warm restart without replug | yes | **no (open bug)** | 🔴 TODO-4 |
 | EDID upload / HPD handshake on start | yes (every open) | yes (in 871-cmd trace, 0x50 ×N) | ✅ |
 | EP1 wedge recovery | drain + stall service | drain + toggle reset + retry | ✅ |
@@ -95,6 +104,37 @@ noted.
 - Poll cadence: wake 50 ms, poll ~10 Hz.  **Only while streaming, after
   setFpgaWork** — polling from probe wedged EP1 (that exact foot-gun is what
   the WIP status debugged around).
+
+### 2026-10-12 — status worker rebuilt (TODO-2 + TODO-3)
+
+Recovered the dropped worker (`git show a7faa76:avmcv710-status.c`) and
+reconciled it with the current tree (audio + cvx live, watchdog live, URBs
+4×2 MB):
+
+- Worker lifecycle moved from "armed in init" (the EP1-wedging bug) to
+  streaming-only: `avm_status_start()` is called at the end of
+  `start_streaming()` (**after** `avm_reset_stream_dma` +
+  `avm_fpga_work_mode(true)`, mirroring `setFpgaWork`); `avm_status_stop()`
+  (`cancel_delayed_work_sync`) runs at the top of `stop_streaming()` and in
+  `disconnect()`.  The work checks `streaming` at entry and re-arms itself
+  only while it stays true; `cancel_delayed_work_sync` neutralizes that
+  requeue (WORK_OFFQ_DISABLE during cancel, verified in
+  `kernel/workqueue.c:__cancel_work_sync`).
+- Overlay delivery: the raw 640×480 BMP is *not* handed to the queue as-is
+  (it would shear in a 1080p consumer).  It is composited centred on a
+  limited-range black raster at the live geometry
+  (`avm_live_geometry()`, shared with `avm_pixfmt()`), cached by
+  (kind, w, h), then delivered through the parser's normal
+  `avm_deliver_frame()` path (payload/timestamp/sequence).  1×4.6 MB
+  `splash_frame` scratch allocated at probe, freed at release.
+- The vendor draws its splash host-side in the renderer; a bare V4L2 node
+  has no renderer, so synthesizing the frame is the closest faithful
+  behaviour (documented divergence).
+- `dev->sig` is now live (was invalid since Stage 0): the parser fallback
+  geometry is fed from the polled measurement before the first frame locks
+  (`avm_live_geometry`), and the converter already consumes
+  `measured_fps`/`active_interlaced`.  The RGB-vs-422 table choice remains
+  the one poll-driven follow-up.
 
 ### 2026-10-11 — `.inf` "device parameter" keys ruled out
 
@@ -151,13 +191,29 @@ tuning) — **not FX3/EP1 commands**.  Nothing to port to the kernel.
 
 ### P1 — correctness of what we already have
 
-- [ ] **TODO-2 ADV7604 status poll (Stage 2)** — port the WIP status worker
-  (`/tmp/opencode/avmcv710-status-wip.c`): 10 Hz poll while streaming,
-  publish `dev->sig`, feed the converter's input rate/RGB/interlace decision,
-  and drive no-signal/out-of-range splash.  Acceptance: `cat
-  /sys/…/format`-equivalent telemetry + overlays appear when the cable is
-  pulled; converter picks the RGB table for a 720p60 RGB source.
-- [ ] Converter: use polled RGB/interlace instead of the 422 assumption.
+- [x] **TODO-2 ADV7604 status poll (Stage 2)** — `avmcv710-status.c` (recovered
+  and rebuilt from git history; the dropped `a7faa76` worker).  The 10 Hz
+  poll runs *only while streaming*: the delayed work is armed by
+  `avm_status_start()` at the end of `start_streaming()` (after FPGA work
+  mode) and cancelled by `avm_status_stop()` in `stop_streaming()` /
+  `disconnect()` — polling an idle FX3 was what wedged EP1 in the earlier
+  adaptive-geometry attempt.  Publishes `dev->sig` (TMDS lock / interlace /
+  measured 12-bit geometry) under `sig_lock`; `dev->sig` already feeds the
+  parser fallback geometry, and interlace/`measured_fps` feed the converter.
+  Acceptance: `journalctl -k` shows the ADV7604 lock, and pulling the HDMI
+  cable flips the overlay (below).
+- [x] **TODO-3 overlays** — same file: when streaming and no real frame has
+  arrived for a 250 ms idle window, the work composites the 640×480
+  no-signal / out-of-range bitmap (generated `avmcv710-bmp.h`) centred on a
+  limited-range black raster at the *live* geometry (`avm_live_geometry()`,
+  shared with `avm_pixfmt()` so consumers see the size they negotiated) and
+  delivers it via `avm_deliver_frame()` — paced at the ~30 Hz tick, cached by
+  (kind, w, h), cleared the moment real frames resume.  Acceptance: pulling
+  the cable during OBS capture shows the AVerMedia-style "no signal" splash
+  instead of a frozen frame.
+- [ ] Converter: read the ADV7604 AVI colorspace flag so a 720p60 RGB source
+  gets the vendor's dedicated RGB table instead of the YCbCr 4:2:2 table
+  (interlace + input rate are already polled/measured).
 
 ### P2 — polish
 

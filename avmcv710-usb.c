@@ -72,6 +72,7 @@ void avm_return_buffers(struct avm_device *dev, enum vb2_buffer_state state)
  * every open file handle on the video node has been closed. */
 void avm_usb_release(struct avm_device *dev)
 {
+	avm_status_fini(dev);
 	avm_audio_fini(dev);
 	avm_cvx8897_fini(dev);
 	destroy_workqueue(dev->wq);
@@ -345,13 +346,14 @@ static int avm_usb_probe(struct usb_interface *intf,
 	usb_set_intfdata(intf, dev);
 
 	/*
-	 * Stage 0 (video-only bring-up): no receiver poll runs, so the
-	 * signal snapshot stays invalid and the parser falls back to its
-	 * word-count mode table.  sig_lock must still be live because the
-	 * parser and the format probes read dev->sig under it.
+	 * ADV7604 status snapshot + standby overlay pump.  This only
+	 * initializes the worker and the overlay scratch buffer; the work is
+	 * armed later from start_streaming(), so no receiver I2C is issued
+	 * until frames are actually being captured.
 	 */
-	spin_lock_init(&dev->sig_lock);
-	dev->sig.valid = false;
+	ret = avm_status_init(dev);
+	if (ret)
+		goto err_wq;
 
 	/* STREAMON watchdog: armed before registration (queue_work only
 	 * below, once all failure paths are gone), cancelled on disconnect. */
@@ -375,6 +377,7 @@ static int avm_usb_probe(struct usb_interface *intf,
 	return 0;
 
 err_wq:
+	avm_status_fini(dev);
 	avm_cvx8897_fini(dev);
 	destroy_workqueue(dev->wq);
 err_urbs:
@@ -442,6 +445,10 @@ static void avm_usb_disconnect(struct usb_interface *intf)
 	mutex_lock(&dev->stream_lock);
 	dev->streaming = false;
 	mutex_unlock(&dev->stream_lock);
+
+	/* Stop the receiver poll / overlay pump before tearing down URBs so
+	 * no I2C read can touch the device mid-disconnect. */
+	avm_status_stop(dev);
 
 	usb_kill_anchored_urbs(&dev->urb_anchor);
 	cancel_delayed_work_sync(&dev->watch_work);

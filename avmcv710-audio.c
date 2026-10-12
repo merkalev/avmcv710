@@ -206,10 +206,30 @@ static snd_pcm_uframes_t avm_audio_pcm_pointer(struct snd_pcm_substream *subs)
 	return bytes_to_frames(rt, pos);
 }
 
+static int avm_audio_pcm_hw_free(struct snd_pcm_substream *subs)
+{
+	struct avm_audio *a = snd_pcm_substream_chip(subs);
+	unsigned long flags;
+
+	/*
+	 * Barrier for the vmalloc DMA buffer: snd_pcm_hw_free() (and the
+	 * private_free path) release rt->dma_area right after this op
+	 * returns, while avm_audio_push() copies 0x58 payload into it
+	 * holding a->lock.  Taking the lock here guarantees no packet is
+	 * mid-memcpy when the application's close frees the buffer - an
+	 * app closing while HDMI audio arrives would otherwise write into
+	 * freed vmalloc memory.
+	 */
+	spin_lock_irqsave(&a->lock, flags);
+	spin_unlock_irqrestore(&a->lock, flags);
+	return 0;
+}
+
 static const struct snd_pcm_ops avm_audio_ops = {
 	.open		= avm_audio_pcm_open,
 	.close		= avm_audio_pcm_close,
 	.hw_params	= avm_audio_pcm_hw_params,
+	.hw_free	= avm_audio_pcm_hw_free,
 	.prepare	= avm_audio_pcm_prepare,
 	.trigger	= avm_audio_pcm_trigger,
 	.pointer	= avm_audio_pcm_pointer,

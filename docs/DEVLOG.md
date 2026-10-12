@@ -38,6 +38,12 @@ Not yet parity (see TODO):
 - Converter RGB-vs-422 choice still assumes YCbCr 4:2:2 (needs AVI colorspace
   flag read)
 
+> Handoff 2026-10-12 (end of session): agent stepped back until the user has
+> installed + tested TODO-1/2/3 (J/K/L in the matrix) and run the TODO-4
+> USB `authorized`-toggle experiment.  A new agent should read
+> `docs/AGENTS.md` first — it is the full handoff (state, commands, RE facts,
+> pitfalls, next steps).
+
 ---
 
 ## Parity matrix

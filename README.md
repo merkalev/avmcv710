@@ -74,8 +74,8 @@ port is written so that no userspace-visible condition can panic the kernel:
   from a generated table (`tools/gen_bootstrap.py` →
   `avmcv710-bootstrap.h`).  Same final register state as the full capture
   bootstrap, ~8x faster to apply.
-- Audio packets (marker `0x58`) are consumed for DMA alignment; there is no
-  ALSA sink yet (phase 2).
+- Audio packets (marker `0x58`) are demuxed into an ALSA capture PCM
+  (`hw:CARD=AVMCV710`, S16LE stereo, 48 kHz, snd-usb-audio push model).
 
 ## Build
 
@@ -112,8 +112,8 @@ output mode first.
 ### Frame rate (CVX8897 converter)
 
 Hardware frame-rate conversion is opt-in, because deciding "half the source
-rate" needs the *input* rate and Stage 0 has no receiver poll (it is inferred
-from the delivered rate while the converter is native):
+rate" needs the *input* rate; the converter infers it from the delivered
+rate while it is in native (non-converted) mode:
 
 ```
 # 0 = off (default), 1 = follow S_PARM (halve when asked for half the source)
@@ -130,17 +130,25 @@ and S_PARM cannot retime it. The converter never scales geometry.
 
 A running development log with the official-driver parity matrix, the
 reverse-engineering ledger and the prioritized TODO list lives in
-[`docs/DEVLOG.md`](docs/DEVLOG.md).
+[`docs/DEVLOG.md`](docs/DEVLOG.md).  The handoff document for continuing the
+work (state, commands, RE facts, pitfalls, open tickets) is
+[`AGENTS.md`](AGENTS.md) — read it before changing driver behavior.
 
 | File | Role |
 | --- | --- |
 | `avmcv710.h` | device/parser/buffer structs, constants, cross-file API |
 | `avmcv710-hw.c` | bootstrap replay (EP1), I2C register access, FPGA work mode, DMA reset |
 | `avmcv710-parser.c` | C0/C1/audio framing parser, mode detect, weaving, delivery |
-| `avmcv710-usb.c` | probe/disconnect, URB pipeline, parse workqueue, teardown |
+| `avmcv710-usb.c` | probe/disconnect, URB pipeline, parse workqueue, teardown, watchdog |
 | `avmcv710-video.c` | V4L2 + vb2 queue, format negotiation, streaming lifecycle |
 | `avmcv710-cvx8897.c` | CVX8897 frame-rate converter (opt-in 60→30 / 50→25) |
+| `avmcv710-audio.c` | ALSA capture PCM (`hw:CARD=AVMCV710`, S16LE stereo 48 kHz) |
+| `avmcv710-status.c` | ADV7604 status poll (10 Hz while streaming) + no-signal/out-of-range overlays |
+| `avmcv710-bootstrap.h` | pre-parsed 871-command bootstrap table (tracked) |
+| `avmcv710-bmp.h` | generated (gitignored) 640×480 YUY2 overlay bitmaps |
+| `avmcv710-cvx8897.h` | generated (gitignored) CVX8897 register tables |
 | `tools/gen_bootstrap.py` | generates `avmcv710-bootstrap.h` from the original trace |
+| `tools/gen_bmp.py` | generates `avmcv710-bmp.h` |
 | `tools/gen_cvx8897.py` | generates `avmcv710-cvx8897.h` from the userspace tables |
 
 Protocol details (markers, checksums, chunk size, HDCP notes) are documented
@@ -150,8 +158,8 @@ in the userspace repo's `PROTOCOL.md`.
 
 - EDID patching, VID_STD auto-switch (receiver cross-checks are read-only
   telemetry), HDCP gating — single-vendor module, no copy-protection games.
-- ALSA PCM capture from the EP 0x83 audio packets (phase 2; the parser
-  already consumes audio words for raster alignment).
+- Auto-recovery from the soft-reload "silent pipe" (TODO-4, watchdog is the
+  tripwire; open — see [`AGENTS.md`](AGENTS.md) §4).
 
 ## Licence
 

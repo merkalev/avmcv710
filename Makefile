@@ -22,8 +22,7 @@ endif
 ccflags-y += -Wframe-larger-than=2048
 
 # Convenience wrapper for out-of-tree builds:
-#   make KDIR=/lib/modules/$(uname -r)/build
-KDIR ?= /lib/modules/$(shell uname -r)/build
+KDIR ?= $(shell if [ -d "/lib/modules/$$(uname -r)/build" ]; then echo "/lib/modules/$$(uname -r)/build"; else ls -d /lib/modules/*/build 2>/dev/null | sort -V | tail -n 1; fi)
 
 .PHONY: modules clean install
 modules:

@@ -138,11 +138,21 @@ Triage rule: **accept a ticket only on the user's test report**, then move its
 ## 4. TODO-4 — the one open ticket, and the experiment that decides it
 
 **Bug:** `rmmod`/`modprobe` (warm start, no replug) → OBS gets frozen/black
-frames.  A physical replug reboots the FX3 firmware and fixes it.  A module
-reload does not reset the USB device, and the FX3 stays in a state where
-EP 0x83 never produces data (soft-reload, "silent pipe").  The watchdog
-(`avmcv710-usb.c: avm_watchdog`) currently only *flags* it
-(`STREAMON with no EP 0x83 data` after ~5 s) — it does not recover.
+frames ("silent pipe"), or if EP1 was wedged in the prior session, probe
+itself times out with `-110` during `avm_bootstrap()`:
+```text
+Thg 10 13 23:08:14 ProDesk kernel: usbcore: deregistering interface driver avmcv710
+Thg 10 13 23:08:49 ProDesk kernel: avmcv710 2-1:1.0: probe with driver avmcv710 failed with error -110
+Thg 10 13 23:08:49 ProDesk kernel: usbcore: registered new interface driver avmcv710
+```
+A physical replug reboots the FX3 firmware and fixes it. A module reload does not
+reset the USB device, so if EP1 was wedged, the 871-command bootstrap sequence times out
+after ~35 s across retries. If EP1 was not wedged, the FPGA stays in a state where EP 0x83
+never produces data (soft-reload, "silent pipe"). The watchdog
+(`avmcv710-usb.c: avm_watchdog`) currently flags it
+(`STREAMON with no EP 0x83 data` after ~5 s) and optionally attempts
+`usb_reset_device(udev)` if `auto_reset=1`.
+
 
 **The decision experiment (user must run it — agent cannot sudo):**
 
@@ -274,7 +284,7 @@ Decision tree (implement based ONLY on the result):
 | TODO-1 | ALSA capture PCM | built + committed `aa16708` + oops fix (opt-in `avm_audio=1`) — **user test pending** |
 | TODO-2 | ADV7604 status poll | built + committed `482fed3`,`7ebb4b6` — **user test pending** |
 | TODO-3 | No-signal/out-of-range overlays | built + committed `482fed3` — **user test pending** |
-| TODO-4 | Soft-reload no output | auto-recovery module param `auto_reset` (default 0=off, triggers `usb_reset_device` on silent pipe) |
+| TODO-4 | Soft-reload / probe -110 timeout | probe timeout -110 after wedged EP1; auto-recovery module param `auto_reset` (default 0=off); test pending after replug |
 | — | 2026-10-12 bug-hunt fixes (8 bugs: unload pin, adaptive-mode dead delivery, sequence race, adapter shared scratch mode, URB fail-path leak, status-work pre-init cancel, bootstrap scratch guard, audio hw_free barrier) | fixed + committed; see `### 2026-10-12 (late)` devlog entry |
 | — | 2026-10-13 bug-hunt & completion (DMA bounce buffers, inter-frame audio, alignment, colorspace auto-detection, ALSA 32k/44.1k/48k, EPIPE stall recovery, auto_reset watchdog) | fixed + compiled; see `### 2026-10-13` devlog entry |
 | — | Converter RGB-vs-422 (AVI colorspace flag) | ✅ auto-detected via HDMI 0x34 reg 0x53 (720p60 RGB table selected) |

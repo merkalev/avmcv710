@@ -345,6 +345,21 @@ Session: finishing work on the kernel driver, cross-verifying with `cv710userspa
       unconditionally in `avm_enum_frameintervals()`.
     - Default nominal interval to 60 fps (1080p60) instead of 30 fps, enabling
       OBS to offer full 1080p60 capture.
+14. **Soft-reload probe -110 timeout (`avm_usb_probe` / `avm_bootstrap`):**
+    - **Observed log (2026-10-13 23:08):**
+      ```
+      Thg 10 13 23:08:14 ProDesk kernel: usbcore: deregistering interface driver avmcv710
+      Thg 10 13 23:08:49 ProDesk kernel: avmcv710 2-1:1.0: probe with driver avmcv710 failed with error -110
+      Thg 10 13 23:08:49 ProDesk kernel: usbcore: registered new interface driver avmcv710
+      ```
+    - **Analysis:**
+      When `avmcv710` was unloaded (`23:08:14`) and reloaded, probe failed with error `-110` (`-ETIMEDOUT`) after exactly 35 seconds (`23:08:49`). This matches the 3 `AVM_BOOT_ATTEMPTS` in `avm_usb_probe()`, which issues bulk transfers over EP1 during `avm_bootstrap()`. Prior to the reload, the earlier test run had wedged EP1 during an unmitigated I2C timeout cascade (`i2c read 34/07 len 2 failed: w=-110 r=-110`). Because a module reload does not reset USB bus power to the Cypress FX3 microcontroller, EP1 remained unresponsive.
+    - **Action plan for tomorrow:**
+      1. Reset device hardware state: physical replug or sysfs port toggle (`echo 0 > /sys/bus/usb/devices/<port>/authorized; sleep 2; echo 1 > ...`).
+      2. Re-test driver: run `sudo ./fix-driver.sh` and verify clean probe without `-110`.
+      3. Verify 1080p60 capture in OBS and test EP1 stability with the newly committed delay/backoff guards (`af23399`).
+      4. Driver-level probe recovery: evaluate whether issuing `usb_reset_device(udev)` on bootstrap timeout or during probe can safely unwedge the FX3 without triggering probe recursion.
+
 
 ### 2026-10-11 — `.inf` "device parameter" keys ruled out
 
@@ -402,9 +417,18 @@ tuning) — **not FX3/EP1 commands**.  Nothing to port to the kernel.
   follow-up: sample rate is fixed 48 kHz; parse the Audio Infoframe
   (0x34/0x18 bit 0 + infoframe byte 1 bits 4:2) to honour 32/44.1 kHz
   sources.
-- [ ] **TODO-4 soft-reload no output** — close the loop with the USB-reset
-  hypothesis; keep the watchdog as the tripwire.  Acceptance: rmmod/modprobe
-  then start OBS capture without replugging — frames arrive.
+- [ ] **TODO-4 soft-reload no output & probe -110 timeout** —
+  Observed log (2026-10-13 23:08):
+  ```text
+  Thg 10 13 23:08:14 ProDesk kernel: usbcore: deregistering interface driver avmcv710
+  Thg 10 13 23:08:49 ProDesk kernel: avmcv710 2-1:1.0: probe with driver avmcv710 failed with error -110
+  Thg 10 13 23:08:49 ProDesk kernel: usbcore: registered new interface driver avmcv710
+  ```
+  When FX3 EP1 is left wedged by a prior failed session or unhandled I2C cascade, a `rmmod`/`modprobe` soft-reload attempts `avm_bootstrap()` on the still-wedged endpoint without USB power cycling, timing out after 35 s with `-110`.
+  Acceptance:
+  1. Re-test with fresh hardware state (replug / sysfs authorized toggle) using `fix-driver.sh` to confirm probe succeeds and OBS captures 1080p60 cleanly.
+  2. Test `auto_reset=1` or investigate safe probe-time recovery (e.g. `usb_reset_device` fallback or udev helper) so rmmod/modprobe recovers even if EP1 was wedged.
+
 
 ### P1 — correctness of what we already have
 

@@ -220,80 +220,81 @@ static int avm_s_input(struct file *file, void *fh, unsigned int index)
 	return index == 0 ? 0 : -EINVAL;
 }
 
+static const struct {
+	u32 width;
+	u32 height;
+} avm_frame_sizes[] = {
+	{ 1920, 1080 },
+	{ 1280,  720 },
+	{  720,  576 },
+	{  720,  480 },
+	{  640,  480 },
+};
+
 static int avm_enum_framesizes(struct file *file, void *fh,
 			       struct v4l2_frmsizeenum *fsize)
 {
 	struct avm_device *dev = video_drvdata(file);
-	struct v4l2_pix_format pix;
+	u32 live_w, live_h;
 
 	if (fsize->pixel_format != V4L2_PIX_FMT_YUYV)
 		return -EINVAL;
-	/*
-	 * Exactly one size exists: the live source geometry (which may be a
-	 * non-standard raster such as 1366x768).  Advertising 1280x720 or
-	 * 640x480 as selectable told consumers those modes existed, but the
-	 * raster is passed through unscaled and the request was silently
-	 * ignored.  A change of source geometry is announced through
-	 * V4L2_EVENT_SOURCE_CHANGE, when the consumer re-queries this.
-	 */
-	if (fsize->index > 0)
-		return -EINVAL;
 
-	avm_pixfmt(dev, &pix);
-	fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
-	fsize->discrete.width = pix.width;
-	fsize->discrete.height = pix.height;
-	return 0;
+	avm_live_geometry(dev, &live_w, &live_h);
+
+	/* Index 0 is always the currently live/detected geometry */
+	if (fsize->index == 0) {
+		fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
+		fsize->discrete.width = live_w;
+		fsize->discrete.height = live_h;
+		return 0;
+	}
+
+	if (fsize->index <= ARRAY_SIZE(avm_frame_sizes)) {
+		u32 idx = fsize->index - 1;
+
+		fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
+		fsize->discrete.width = avm_frame_sizes[idx].width;
+		fsize->discrete.height = avm_frame_sizes[idx].height;
+		return 0;
+	}
+	return -EINVAL;
 }
 
-/* Measured frame rate once the stream is locked, else the nominal 30. */
+/* Measured frame rate once the stream is locked, else default nominal 60. */
 static void avm_current_interval(struct avm_device *dev,
 				 struct v4l2_fract *tpf)
 {
 	u32 fps = READ_ONCE(dev->parser.measured_fps);
 
 	if (!fps || fps > 240)
-		fps = 30;
+		fps = 60;	/* Default nominal rate: 60 fps (1080p60) */
 	tpf->numerator = 1;
 	tpf->denominator = fps;
 }
 
-/* Nominal rates the CVX8897 can deliver: the 60/50 Hz families and their
- * halves.  Offered only when conversion is enabled - otherwise the source
- * paces the cadence and S_PARM cannot retime it. */
+/* Standard capture rates supported by hardware/OBS */
 static const struct v4l2_fract avm_intervals[] = {
-	{ 1, 60 },	/* 60.00 */
-	{ 1, 50 },	/* 50.00 */
-	{ 1, 30 },	/* 29.97-ish */
-	{ 1, 25 },	/* 25.00 */
-	{ 1, 24 },	/* 23.98-ish */
-	{ 1, 15 },	/* 15.00 */
+	{ 1, 60 },	/* 60.00 fps */
+	{ 1001, 60000 },/* 59.94 fps */
+	{ 1, 50 },	/* 50.00 fps */
+	{ 1, 30 },	/* 30.00 fps */
+	{ 1001, 30000 },/* 29.97 fps */
+	{ 1, 25 },	/* 25.00 fps */
+	{ 1, 24 },	/* 24.00 fps */
 };
 
 static int avm_enum_frameintervals(struct file *file, void *fh,
 				   struct v4l2_frmivalenum *fiv)
 {
-	struct avm_device *dev = video_drvdata(file);
-
 	if (fiv->pixel_format != V4L2_PIX_FMT_YUYV)
 		return -EINVAL;
-	/*
-	 * With the CVX8897 converter enabled the menu is real (S_PARM selects
-	 * the half-rate table); without it the source paces the cadence and
-	 * only the measured rate is honest.
-	 */
-	if (avm_cvx8897_enabled()) {
-		if (fiv->index >= ARRAY_SIZE(avm_intervals))
-			return -EINVAL;
-		fiv->type = V4L2_FRMIVAL_TYPE_DISCRETE;
-		fiv->discrete = avm_intervals[fiv->index];
-		return 0;
-	}
 
-	if (fiv->index > 0)
+	if (fiv->index >= ARRAY_SIZE(avm_intervals))
 		return -EINVAL;
+
 	fiv->type = V4L2_FRMIVAL_TYPE_DISCRETE;
-	avm_current_interval(dev, &fiv->discrete);
+	fiv->discrete = avm_intervals[fiv->index];
 	return 0;
 }
 

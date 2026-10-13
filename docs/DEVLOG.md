@@ -327,6 +327,24 @@ Session: finishing work on the kernel driver, cross-verifying with `cv710userspa
       to ensure period boundaries align with cyclic buffer wraps.
     - Added `SNDRV_PCM_INFO_PAUSE | SNDRV_PCM_INFO_RESUME` flags and handled
       `TRIGGER_PAUSE_RELEASE` and `TRIGGER_RESUME`.
+12. **EP1 control pipe stability & I2C error handling (`avmcv710-hw.c`, `avmcv710-status.c`):**
+    - Removed `avm_ep1_drain()` from live I2C read/write failure paths. Draining
+      mid-stream submits 512-byte bulk IN requests with 20 ms timeouts; on xHCI
+      this aborts/cancels active TRBs and wedges the FX3 endpoint state machine.
+    - Gated `avm_poll_signal()` to abort immediately on the first core read
+      failure (`0x20/0x6A`) instead of issuing 4 more requests into a busy FX3.
+    - Delayed initial status work in `avm_status_start()` by 1000 ms after
+      `start_streaming()` so the FPGA/FX3 video DMA stabilizes before I2C
+      transactions begin.
+    - Added failure backoff: if `poll_failures >= 3`, back off polling interval
+      to 1000 ms (1 Hz) to prevent bus hammering.
+13. **Full standard resolutions and frame rates enumeration (`avmcv710-video.c`):**
+    - Enumerate standard discrete frame sizes: 1920x1080, 1280x720, 720x576,
+      720x480, 640x480.
+    - Enumerate standard frame rates: 60, 59.94, 50, 30, 29.97, 25, 24 fps
+      unconditionally in `avm_enum_frameintervals()`.
+    - Default nominal interval to 60 fps (1080p60) instead of 30 fps, enabling
+      OBS to offer full 1080p60 capture.
 
 ### 2026-10-11 — `.inf` "device parameter" keys ruled out
 

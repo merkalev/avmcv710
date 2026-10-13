@@ -94,20 +94,20 @@ static void avm_poll_signal(struct avm_device *dev)
 	u8 cs = 0;
 	bool lock_change, prev_locked;
 	unsigned long flags;
-	int fails = 0;
 
-	fails += avm_i2c_read_block(dev, 0x20, 0x6A, &io_lock, 1);
-	fails += avm_i2c_read_block(dev, 0x20, 0x12, &io_flags, 1);
-	fails += avm_i2c_read_block(dev, 0x34, 0x07, wb, 2);
-	fails += avm_i2c_read_block(dev, 0x34, 0x09, hb, 2);
-
-	spin_lock_irqsave(&dev->sig_lock, flags);
-	if (fails) {
-		/* keep the last known good snapshot, count the miss */
-		dev->sig.poll_failures++;
-		spin_unlock_irqrestore(&dev->sig_lock, flags);
-		return;
-	}
+	/*
+	 * Abort immediately if any core read fails (cv710userspace CV-13).
+	 * Hammering the control endpoint with further reads when the FX3 is
+	 * busy wedges the EP1 bridge.
+	 */
+	if (avm_i2c_read_block(dev, 0x20, 0x6A, &io_lock, 1))
+		goto err_poll;
+	if (avm_i2c_read_block(dev, 0x20, 0x12, &io_flags, 1))
+		goto err_poll;
+	if (avm_i2c_read_block(dev, 0x34, 0x07, wb, 2))
+		goto err_poll;
+	if (avm_i2c_read_block(dev, 0x34, 0x09, hb, 2))
+		goto err_poll;
 
 	memset(&sig, 0, sizeof(sig));
 	sig.valid = true;
@@ -131,9 +131,9 @@ static void avm_poll_signal(struct avm_device *dev)
 	/* one-shot telemetry on lock transitions, so the poll is visible in
 	 * the kernel log without spamming every 100 ms (logged after the
 	 * spinlock is dropped - printk should not run IRQ-disabled) */
+	spin_lock_irqsave(&dev->sig_lock, flags);
 	prev_locked = dev->sig.valid && dev->sig.tmds_locked;
 	lock_change = prev_locked != sig.tmds_locked;
-
 	dev->sig = sig;
 	spin_unlock_irqrestore(&dev->sig_lock, flags);
 
@@ -143,6 +143,12 @@ static void avm_poll_signal(struct avm_device *dev)
 			 sig.rgb ? "RGB" : "YCbCr");
 	else if (lock_change && !sig.tmds_locked)
 		dev_info(&dev->udev->dev, "signal: TMDS lost\n");
+	return;
+
+err_poll:
+	spin_lock_irqsave(&dev->sig_lock, flags);
+	dev->sig.poll_failures++;
+	spin_unlock_irqrestore(&dev->sig_lock, flags);
 }
 
 /* Does the measured geometry produce stageable, deliverable frames? */
@@ -266,6 +272,9 @@ static void avm_status_work(struct work_struct *work)
 {
 	struct avm_device *dev = container_of(work, struct avm_device,
 					      status_work.work);
+	u32 delay_ms = AVM_STATUS_PERIOD_MS;
+	u32 failures;
+	unsigned long flags;
 
 	/* Stop the chain as soon as streaming ends; start_streaming re-arms. */
 	if (!READ_ONCE(dev->streaming))
@@ -275,8 +284,16 @@ static void avm_status_work(struct work_struct *work)
 		avm_poll_signal(dev);
 	avm_splash_tick(dev);
 
+	spin_lock_irqsave(&dev->sig_lock, flags);
+	failures = dev->sig.poll_failures;
+	spin_unlock_irqrestore(&dev->sig_lock, flags);
+
+	/* If polling fails repeatedly, back off to 1 second intervals */
+	if (failures >= 3)
+		delay_ms = 1000;
+
 	queue_delayed_work(system_dfl_wq, &dev->status_work,
-			   msecs_to_jiffies(AVM_STATUS_PERIOD_MS));
+			   msecs_to_jiffies(delay_ms));
 }
 
 int avm_status_init(struct avm_device *dev)
@@ -307,8 +324,9 @@ void avm_status_start(struct avm_device *dev)
 	dev->status_tick = 0;
 	dev->splash = AVM_SPLASH_NONE;
 	dev->splash_cached = AVM_SPLASH_NONE;	/* force a fresh composite */
+	/* Delay initial poll by 1 s so the FX3 stream DMA settles before I2C traffic */
 	queue_delayed_work(system_dfl_wq, &dev->status_work,
-			   msecs_to_jiffies(AVM_STATUS_PERIOD_MS));
+			   msecs_to_jiffies(1000));
 }
 
 void avm_status_stop(struct avm_device *dev)

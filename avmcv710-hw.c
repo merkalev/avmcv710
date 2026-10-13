@@ -138,8 +138,6 @@ int avm_i2c_write(struct avm_device *dev, u8 slave7, u8 reg, u8 val)
 
 	mutex_lock(&dev->ctrl_lock);
 	ret = avm_ep1_write_t(dev, cmd, sizeof(cmd), AVM_STATUS_IO_TIMEOUT);
-	if (ret)
-		avm_ep1_drain(dev);
 	mutex_unlock(&dev->ctrl_lock);
 	return ret;
 }
@@ -160,12 +158,6 @@ int avm_i2c_read_block(struct avm_device *dev, u8 slave7, u8 reg,
 	else
 		ret = wret;
 	if (ret) {
-		/*
-		 * A failed read can leave the FX3's late reply sitting in the
-		 * EP1 IN FIFO; the next control command then reads that stale
-		 * byte, desyncs, and wedges the endpoint.  Consume it now.
-		 */
-		avm_ep1_drain(dev);
 		dev_warn_ratelimited(&dev->udev->dev,
 			"i2c read %02x/%02x len %u failed: w=%d r=%d\n",
 			slave7, reg, len, wret, ret);

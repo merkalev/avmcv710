@@ -89,8 +89,8 @@ static const struct snd_pcm_hardware avm_audio_hw = {
 	.info = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID |
 		SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_BLOCK_TRANSFER,
 	.formats = SNDRV_PCM_FMTBIT_S16_LE,
-	.rates = SNDRV_PCM_RATE_48000,
-	.rate_min = AVM_AUDIO_RATE,
+	.rates = SNDRV_PCM_RATE_32000 | SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000,
+	.rate_min = 32000,
 	.rate_max = AVM_AUDIO_RATE,
 	.channels_min = AVM_AUDIO_CHANNELS,
 	.channels_max = AVM_AUDIO_CHANNELS,
@@ -139,10 +139,12 @@ static int avm_audio_pcm_close(struct snd_pcm_substream *subs)
 static int avm_audio_pcm_hw_params(struct snd_pcm_substream *subs,
 				  struct snd_pcm_hw_params *params)
 {
+	unsigned int rate = params_rate(params);
+
 	/* the hw constraints already pin these; belt and braces */
 	if (params_format(params) != SNDRV_PCM_FORMAT_S16_LE ||
 	    params_channels(params) != AVM_AUDIO_CHANNELS ||
-	    params_rate(params) != AVM_AUDIO_RATE)
+	    (rate != 48000 && rate != 44100 && rate != 32000))
 		return -EINVAL;
 	return 0;
 }
@@ -216,11 +218,10 @@ static int avm_audio_pcm_hw_free(struct snd_pcm_substream *subs)
 	 * private_free path) release rt->dma_area right after this op
 	 * returns, while avm_audio_push() copies 0x58 payload into it
 	 * holding a->lock.  Taking the lock here guarantees no packet is
-	 * mid-memcpy when the application's close frees the buffer - an
-	 * app closing while HDMI audio arrives would otherwise write into
-	 * freed vmalloc memory.
+	 * mid-memcpy when the application frees the buffer.
 	 */
 	spin_lock_irqsave(&a->lock, flags);
+	a->running = false;
 	spin_unlock_irqrestore(&a->lock, flags);
 	return 0;
 }

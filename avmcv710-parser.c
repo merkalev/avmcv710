@@ -225,6 +225,7 @@ void avm_parser_reset(struct avm_device *dev)
 
 	memset(p->hold, 0, sizeof(p->hold));
 	p->hold_n = 0;
+	p->stream_locked = false;
 	p->in_video = false;
 	p->in_audio = false;
 	p->in_audio_padding = false;
@@ -552,7 +553,7 @@ void avm_parser_feed(struct avm_device *dev, u32 *d, u32 count)
 	}
 
 	/* Initial lock hunt: discard data before the first valid C0 header. */
-	if (!p->in_video && p->frame_words == 0) {
+	if (!p->stream_locked) {
 		while (i + 1 < count) {
 			u32 meta, b0, b1, b2, b3, chk;
 
@@ -573,12 +574,13 @@ void avm_parser_feed(struct avm_device *dev, u32 *d, u32 count)
 				p->in_video = true;
 				p->frame_words = 0;
 				p->fields_woven = 0;
+				p->stream_locked = true;
 				i += 2;
 				break;
 			}
 			i++;
 		}
-		if (!p->in_video) {
+		if (!p->stream_locked) {
 			/* last word may be the first half of a C0 pair */
 			if (i < count)
 				avm_hold(p, d, i, count);
@@ -666,10 +668,7 @@ void avm_parser_feed(struct avm_device *dev, u32 *d, u32 count)
 				p->frame_words = 0;
 				p->in_video = false;
 				p->fields_woven = 0;
-				i += 2;
-				if (i < count && (d[i] < 0x10000 ||
-						  (d[i] & 0xFF000000) == 0))
-					i++;
+				i += 3;
 				continue;
 			}
 
@@ -700,7 +699,8 @@ void avm_parser_feed(struct avm_device *dev, u32 *d, u32 count)
 			raw = d[i + 1];
 			audio_bytes = (((raw >> 16) & 0xFF) << 8) |
 				       ((raw >> 24) & 0xFF);
-			if (audio_bytes >= 512 && audio_bytes <= 8192) {
+			if (audio_bytes >= 512 && audio_bytes <= 8192 &&
+			    (audio_bytes & 3) == 0) {
 				u32 audio_words = audio_bytes / 4;
 				u32 avail = count - (i + 2);
 

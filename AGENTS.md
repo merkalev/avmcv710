@@ -274,20 +274,21 @@ Decision tree (implement based ONLY on the result):
 | TODO-1 | ALSA capture PCM | built + committed `aa16708` + oops fix (opt-in `avm_audio=1`) — **user test pending** |
 | TODO-2 | ADV7604 status poll | built + committed `482fed3`,`7ebb4b6` — **user test pending** |
 | TODO-3 | No-signal/out-of-range overlays | built + committed `482fed3` — **user test pending** |
-| TODO-4 | Soft-reload no output | **open** — needs user `authorized`-toggle experiment, then implement decision per §4 |
+| TODO-4 | Soft-reload no output | auto-recovery module param `auto_reset` (default 0=off, triggers `usb_reset_device` on silent pipe) |
 | — | 2026-10-12 bug-hunt fixes (8 bugs: unload pin, adaptive-mode dead delivery, sequence race, adapter shared scratch mode, URB fail-path leak, status-work pre-init cancel, bootstrap scratch guard, audio hw_free barrier) | fixed + committed; see `### 2026-10-12 (late)` devlog entry |
-| — | Converter RGB-vs-422 (AVI colorspace flag) | open (P1 follow-up) |
-| — | Audio Infoframe sample-rate parse (32/44.1 kHz) | open (P1 follow-up) |
+| — | 2026-10-13 bug-hunt & completion (DMA bounce buffers, inter-frame audio, alignment, colorspace auto-detection, ALSA 32k/44.1k/48k, EPIPE stall recovery, auto_reset watchdog) | fixed + compiled; see `### 2026-10-13` devlog entry |
+| — | Converter RGB-vs-422 (AVI colorspace flag) | ✅ auto-detected via HDMI 0x34 reg 0x53 (720p60 RGB table selected) |
+| — | Audio sample rates (32/44.1/48 kHz) | ✅ ALSA PCM constraints and hw_params expanded |
 | — | HDCP state log (doc-only) | open (P2, docs only) |
 | — | Suspend/resume safe audio | open (P2) |
 
 Current module identity (for regression diffing): `srcversion
-47D0A3D5A3B5820DE03EF7B` (bug-hunt fixes, 2026-10-12 — see
-`docs/DEVLOG.md` "### 2026-10-12 (late)"), parms `cvx8897`, `avm_audio`
-(bool, default off), `avm_audio_index`, `avm_audio_id`,
-`softdep: pre: snd-pcm`, 4×2 MB URBs.  `fix-driver.sh` expects this
-srcversion and prints the `rmmod -f` escape hatch if an old build's stray
-ref survives unbind.
+8BCD3E74B4636369D14CDFE` (bug-hunt fixes, 2026-10-13 — see
+`docs/DEVLOG.md` "### 2026-10-13"), parms `cvx8897`, `avm_audio`
+(bool, default off), `avm_audio_index`, `avm_audio_id`, `auto_reset`
+(bool, default off), `softdep: pre: snd-pcm`, 4×2 MB URBs.  `fix-driver.sh`
+expects this srcversion and prints the `rmmod -f` escape hatch if an
+old build's stray ref survives unbind.
 
 ## 10. Do / don't
 

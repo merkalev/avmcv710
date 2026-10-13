@@ -91,6 +91,7 @@ static void avm_poll_signal(struct avm_device *dev)
 	struct avm_signal sig;
 	u8 io_lock = 0, io_flags = 0;
 	u8 wb[2] = { 0, 0 }, hb[2] = { 0, 0 };
+	u8 cs = 0;
 	bool lock_change, prev_locked;
 	unsigned long flags;
 	int fails = 0;
@@ -118,6 +119,15 @@ static void avm_poll_signal(struct avm_device *dev)
 	sig.w = ((wb[0] & 0x0F) << 8) | wb[1];
 	sig.h = ((hb[0] & 0x0F) << 8) | hb[1];
 
+	/* Optional colorspace read (HDMI 0x34 reg 0x53, low nibble <= 1 is RGB) */
+	if (avm_i2c_read_block(dev, 0x34, 0x53, &cs, 1) == 0) {
+		sig.colorspace = cs & 0x0F;
+		sig.rgb = (sig.colorspace <= 0x01);
+	} else {
+		sig.colorspace = 0xFF;
+		sig.rgb = false;
+	}
+
 	/* one-shot telemetry on lock transitions, so the poll is visible in
 	 * the kernel log without spamming every 100 ms (logged after the
 	 * spinlock is dropped - printk should not run IRQ-disabled) */
@@ -128,8 +138,9 @@ static void avm_poll_signal(struct avm_device *dev)
 	spin_unlock_irqrestore(&dev->sig_lock, flags);
 
 	if (lock_change && sig.tmds_locked)
-		dev_info(&dev->udev->dev, "signal: TMDS locked %ux%u%s\n",
-			 sig.w, sig.h, sig.interlaced ? " (interlaced)" : "");
+		dev_info(&dev->udev->dev, "signal: TMDS locked %ux%u%s (%s)\n",
+			 sig.w, sig.h, sig.interlaced ? " (interlaced)" : "",
+			 sig.rgb ? "RGB" : "YCbCr");
 	else if (lock_change && !sig.tmds_locked)
 		dev_info(&dev->udev->dev, "signal: TMDS lost\n");
 }

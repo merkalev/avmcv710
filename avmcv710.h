@@ -103,6 +103,7 @@ struct avm_parser {
 	unsigned int hold_n;
 
 	/* stream state */
+	bool stream_locked;
 	bool in_video;
 	bool in_audio;
 	bool in_audio_padding;
@@ -161,6 +162,8 @@ struct avm_signal {
 	bool valid;		/* at least one successful poll published */
 	bool tmds_locked;	/* IO 0x6a: (v & 0xE0) == 0xE0 && (v & 0x10) */
 	bool interlaced;	/* IO 0x12 STDI bit 4 */
+	bool rgb;		/* HDMI 0x53: <= 0x01 is RGB (vs YCbCr) */
+	u8 colorspace;		/* raw HDMI 0x53 low nibble */
 	u32 w, h;		/* measured active geometry (12-bit, 0 = n/a) */
 	u32 poll_failures;	/* consecutive failed polls */
 };

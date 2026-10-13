@@ -109,8 +109,15 @@ void avm_live_geometry(struct avm_device *dev, u32 *w, u32 *h)
 static void avm_pixfmt(struct avm_device *dev, struct v4l2_pix_format *pix)
 {
 	u32 w, h;
+	u8 cs = 0xFF;
+	unsigned long flags;
 
 	avm_live_geometry(dev, &w, &h);
+
+	spin_lock_irqsave(&dev->sig_lock, flags);
+	if (dev->sig.valid)
+		cs = dev->sig.colorspace;
+	spin_unlock_irqrestore(&dev->sig_lock, flags);
 
 	pix->width = w;
 	pix->height = h;
@@ -121,11 +128,16 @@ static void avm_pixfmt(struct avm_device *dev, struct v4l2_pix_format *pix)
 	pix->colorspace = V4L2_COLORSPACE_SMPTE170M;
 	/*
 	 * Declare the colorimetry the FPGA passes through.  HDMI YCbCr is
-	 * limited range; BT.601 for SD, BT.709 for HD.  Consumers (OBS) use
-	 * this for their conversion; leaving it all zero (DEFAULT) offered no
-	 * hint and produced washed-out/clipped colour.
+	 * limited range; BT.601 for SD, BT.709 for HD.
+	 * If ADV7604 reported full-range (HDMI 0x53 codes 1=RGB full,
+	 * 6=YCbCr601 full, 7=YCbCr709 full), declare full range so OBS
+	 * does not clip whites or crush blacks.
 	 */
-	pix->quantization = V4L2_QUANTIZATION_LIM_RANGE;
+	if (cs == 1 || cs == 6 || cs == 7)
+		pix->quantization = V4L2_QUANTIZATION_FULL_RANGE;
+	else
+		pix->quantization = V4L2_QUANTIZATION_LIM_RANGE;
+
 	if (h > 576) {
 		pix->colorspace = V4L2_COLORSPACE_REC709;
 		pix->ycbcr_enc = V4L2_YCBCR_ENC_709;
@@ -631,7 +643,7 @@ int avm_video_register(struct avm_device *dev)
 	}
 
 	dev->q.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	dev->q.io_modes = VB2_MMAP | VB2_USERPTR;
+	dev->q.io_modes = VB2_MMAP | VB2_USERPTR | VB2_READ;
 	dev->q.mem_ops = &vb2_vmalloc_memops;
 	dev->q.ops = &avm_vb2_ops;
 	dev->q.buf_struct_size = sizeof(struct avm_buffer);

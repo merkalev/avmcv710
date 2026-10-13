@@ -21,18 +21,28 @@
  * group).  Bootstrap uses generous timeouts; live status reads use the
  * same 500 ms the userspace driver does so a wedged control pipe cannot
  * stall the poll worker for seconds. */
+/*
+ * usb_bulk_msg() needs a DMA-able buffer: callers routinely pass stack
+ * arrays, which are vmalloc'd under CONFIG_VMAP_STACK.  Bounce every EP1
+ * transfer through kmalloc'd memory here so no caller has to care.
+ */
 static int avm_ep1_write_t(struct avm_device *dev, const u8 *data,
 			   size_t len, int timeout)
 {
 	int actual = 0;
 	int ret;
+	u8 *buf;
 
 	if (WARN_ON_ONCE(len > 2048))
 		return -EINVAL;
 
+	buf = kmemdup(data, len, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
 	ret = usb_bulk_msg(dev->udev,
 			   usb_sndbulkpipe(dev->udev, AVM_EP_CTRL_OUT),
-			   (void *)data, len, &actual, timeout);
+			   buf, len, &actual, timeout);
+	kfree(buf);
 	if (ret < 0)
 		return ret;
 	if (actual != len)
@@ -45,10 +55,20 @@ static int avm_ep1_read_t(struct avm_device *dev, u8 *data, size_t len,
 {
 	int actual = 0;
 	int ret;
+	u8 *buf;
 
+	if (WARN_ON_ONCE(len > 2048))
+		return -EINVAL;
+
+	buf = kmalloc(len, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
 	ret = usb_bulk_msg(dev->udev,
 			   usb_rcvbulkpipe(dev->udev, AVM_EP_CTRL_IN),
-			   data, len, &actual, timeout);
+			   buf, len, &actual, timeout);
+	if (ret >= 0 && actual > 0)
+		memcpy(data, buf, min_t(size_t, actual, len));
+	kfree(buf);
 	if (ret < 0)
 		return ret;
 	if (actual != len)
@@ -80,17 +100,22 @@ int avm_ep1_read(struct avm_device *dev, u8 *data, size_t len)
  */
 void avm_ep1_drain(struct avm_device *dev)
 {
-	u8 buf[512];
+	u8 *buf;
 	int actual, ret, i;
+
+	buf = kmalloc(512, GFP_KERNEL);
+	if (!buf)
+		return;
 
 	for (i = 0; i < 4; i++) {
 		actual = 0;
 		ret = usb_bulk_msg(dev->udev,
 				   usb_rcvbulkpipe(dev->udev, AVM_EP_CTRL_IN),
-				   buf, sizeof(buf), &actual, 20);
-		if (ret || actual < (int)sizeof(buf))
+				   buf, 512, &actual, 20);
+		if (ret || actual < 512)
 			break;
 	}
+	kfree(buf);
 }
 
 /* Status-path EP1 transactions (500 ms, like the userspace driver). */

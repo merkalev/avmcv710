@@ -135,10 +135,16 @@ static void avm_parse_work(struct work_struct *work)
 		 * to the per-URB retry cap, then leave it out of the pool.
 		 */
 		if (u->err) {
-			if (u->errors < 3)
+			if (u->urb->status == -EPIPE) {
+				dev_warn_ratelimited(&dev->udev->dev,
+					"video endpoint stalled (EPIPE); clearing halt\n");
+				usb_clear_halt(dev->udev,
+					       usb_rcvbulkpipe(dev->udev, AVM_EP_VIDEO_IN));
+			} else if (u->errors < 3) {
 				dev_warn_ratelimited(&dev->udev->dev,
 					"video URB status %d (error %u)\n",
 					u->urb->status, u->errors + 1);
+			}
 			if (++u->errors > AVM_URB_MAX_ERRORS) {
 				dev_warn_ratelimited(&dev->udev->dev,
 					"bulk URB failing repeatedly; retiring one URB\n");
@@ -151,6 +157,11 @@ static void avm_parse_work(struct work_struct *work)
 
 		usb_anchor_urb(u->urb, &dev->urb_anchor);
 		ret = usb_submit_urb(u->urb, GFP_KERNEL);
+		if (ret == -EPIPE) {
+			usb_clear_halt(dev->udev,
+				       usb_rcvbulkpipe(dev->udev, AVM_EP_VIDEO_IN));
+			ret = usb_submit_urb(u->urb, GFP_KERNEL);
+		}
 		if (ret) {
 			/* endpoint halted / disconnect: leave it unanchored
 			 * and unarmed; the pipeline simply goes quiet and
@@ -397,6 +408,11 @@ err_free:
 	return ret;
 }
 
+static bool auto_reset;
+module_param(auto_reset, bool, 0644);
+MODULE_PARM_DESC(auto_reset,
+	"Auto-reset USB device via usb_reset_device() when watchdog detects silent stream (default 0=off)");
+
 /*
  * STREAMON watchdog: every 5 s, if streaming is up but no EP 0x83 chunk has
  * completed since the last sample, the pipe is silently idle.  This is the
@@ -421,6 +437,11 @@ static void avm_watchdog(struct work_struct *work)
 					 "watchdog: STREAMON but no EP0x83 chunk "
 					 "completed for 5 s - silent FPGA after "
 					 "a soft reload? Replug the device\n");
+				if (auto_reset) {
+					dev_info(&dev->udev->dev,
+						 "watchdog: auto_reset enabled; attempting usb_reset_device()\n");
+					usb_reset_device(dev->udev);
+				}
 			}
 		} else if (dev->watch_silent) {
 			dev->watch_silent = false;
@@ -459,8 +480,8 @@ static void avm_usb_disconnect(struct usb_interface *intf)
 
 	usb_kill_anchored_urbs(&dev->urb_anchor);
 	cancel_delayed_work_sync(&dev->watch_work);
-	cancel_work_sync(&dev->cvx_work);
 	flush_workqueue(dev->wq);
+	cancel_work_sync(&dev->cvx_work);
 
 	/*
 	 * Drop the ALSA module pin now, not from the vdev release callback:

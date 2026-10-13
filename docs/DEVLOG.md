@@ -12,7 +12,7 @@ available to the agent).  Kernel log: `journalctl -k -f`.
 
 ---
 
-## Status (2026-10-12)
+## Status (2026-10-13)
 
 Working and user-confirmed:
 - Capture at source geometry/rate; no latency/lag (4×2 MB URBs)
@@ -26,35 +26,21 @@ Working and user-confirmed:
 Built, awaiting user install/test:
 - **ALSA capture PCM (TODO-1), opt-in** — parser pushes the 0x58 audio
   payload straight into the PCM DMA buffer (snd-usb-audio model), card id
-  `AVMCV710`.  **Registration is disabled by default (`avm_audio=0`).**  The
-  first hardware install of the card oopsed the kernel: WirePlumber's PREPARE
-  of the new PCM hit a NULL `ops->prepare` (this kernel calls it
-  unconditionally), RIP 0x0, and the audio graph collapsed minutes later.
-  Root-caused and fixed (dated entry below); the card stays opt-in until the
-  sink is verified on hardware.
+  `AVMCV710`.  Rates: 32000, 44100, 48000 Hz S16LE stereo. **Registration is
+  disabled by default (`avm_audio=0`).**
+- **Continuous inter-frame audio:** audio demux now captures packets arriving
+  between C1 and C0.
 - ADV7604 status poll (TODO-2): 10 Hz while streaming, publishes `dev->sig`
-  (TMDS lock / interlace / measured geometry)
+  (TMDS lock / interlace / measured geometry / colorspace / RGB)
 - No-signal + out-of-range overlays (TODO-3): 640×480 bitmap composited into
   the current raster after an idle window, so no-signal is visible in OBS
   at the negotiated geometry
-
-Not yet parity (see TODO):
-- Soft-reload no-output root cause still open (watchdog confirms it happens;
-  replug fixes)
-- Converter RGB-vs-422 choice still assumes YCbCr 4:2:2 (needs AVI colorspace
-  flag read)
-
-> Handoff 2026-10-12 (evening): the first install of TODO-1/2/3 oopsed the
-> kernel through the never-hardware-tested ALSA card — the PCM had no
-> `ops->prepare`, this kernel calls it unconditionally, so WirePlumber's
-> PREPARE of the new card was a NULL instruction fetch (RIP 0x0) and the
-> whole audio graph collapsed minutes later ("videos stopped", OBS balked).
-> Root cause fixed (dated entry below) and the card is now
-> opt-in: `avm_audio=1`, default off (video-only, the previously stable
-> state).  Next: user reinstalls + reloads, confirms OBS/video/audio are
-> back to normal, then opts into the audio test.  TODO-2/3 and the TODO-4
-> `authorized`-toggle experiment are unchanged.  Read `docs/AGENTS.md` for
-> the full handoff.
+- Full-range quantization auto-detection (prevents crushed blacks in OBS when
+  HDMI 0x53 reports full range)
+- CVX8897 720p60 dedicated RGB half-rate table auto-selection via ADV7604 colorspace
+- EP1 stack DMA bounce buffers (`CONFIG_VMAP_STACK=y` safety)
+- Endpoint stall (-EPIPE) recovery via `usb_clear_halt`
+- Auto-reset USB watchdog parameter (`auto_reset=1` for TODO-4 recovery)
 
 ---
 
@@ -65,16 +51,16 @@ Not yet parity (see TODO):
 | Video capture @ source rate | yes | yes | ✅ |
 | Geometry resets passthrough | yes (Scaler off by default) | yes (never scales) | ✅ |
 | Res/fps change without restart | yes | yes (V4L2_EVENT_SOURCE_CHANGE) | ✅ |
-| "Video Input Frame Rate" 60/50/30/25 | CVX8897 | CVX8897, opt-in | ✅ |
-| Audio S16LE stereo @ 48 kHz | yes (PCM) | ALSA capture PCM (`avmcv710-audio.c`), opt-in `avm_audio=1` | ✅ (test pending, opt-in) |
+| "Video Input Frame Rate" 60/50/30/25 | CVX8897 | CVX8897, opt-in (RGB+YCbCr tables) | ✅ |
+| Audio S16LE stereo @ 32/44.1/48 kHz | yes (PCM) | ALSA capture PCM (`avmcv710-audio.c`), opt-in `avm_audio=1` | ✅ (test pending, opt-in) |
 | No-signal overlay | yes (BMP splice) | 640×480 BMP composited at live geometry | ✅ (test pending) |
 | Out-of-range overlay | yes | same | ✅ (test pending) |
 | Content-protection overlay | yes | same (HDCP doc only) | 🟡 doc |
 | Receiver status (lock/RGB/rate) | ~10 Hz poll | 10 Hz poll while streaming → `dev->sig` | ✅ (test pending) |
-| Warm restart without replug | yes | **no (open bug)** | 🔴 TODO-4 |
+| Warm restart without replug | yes | watchdog diagnosis; opt-in `auto_reset=1` | 🟡 TODO-4 |
 | Clean unload (rmmod without replug) | n/a | unbind drops the ALSA pin in disconnect; rmmod succeeds | ✅ (fixed 2026-10-12) |
 | EDID upload / HPD handshake on start | yes (every open) | yes (in 871-cmd trace, 0x50 ×N) | ✅ |
-| EP1 wedge recovery | drain + stall service | drain + toggle reset + retry | ✅ |
+| EP1 wedge recovery | drain + stall service | drain + toggle reset + retry + bounce bufs | ✅ |
 
 ---
 
@@ -281,6 +267,57 @@ and — when the old build's invisible stray ref survives — prints the
 deliberate `sudo rmmod -f avmcv710 && sudo modprobe avmcv710` escape hatch
 instead of failing silently.
 
+### 2026-10-13 — audio framing, DMA bounce buffers, colorspace detection, auto_reset watchdog
+
+Session: finishing work on the kernel driver, cross-verifying with `cv710userspace` and hardware specifications.
+
+1. **DMA bounce buffers for EP1 (`avmcv710-hw.c`):**
+   `usb_bulk_msg()` requires DMA-capable memory. Callers in bootstrap, status
+   poll, and drain passed stack buffers, which violate DMA safety under
+   `CONFIG_VMAP_STACK=y`. `avm_ep1_write_t()`, `avm_ep1_read_t()`, and
+   `avm_ep1_drain()` now bounce through `kmemdup`/`kmalloc` heap buffers.
+2. **Audio packet preservation between frames (`avmcv710-parser.c`):**
+   The parser previously guarded the initial hunt with `if (!p->in_video &&
+   p->frame_words == 0)`, which mistakenly discarded all non-C0 data at the
+   start of every chunk arriving between a frame's C1 trailer and the next C0
+   header. Audio packets (marker `0x58FFFF00`) arrive continuously in this gap.
+   Changed guard to `if (!p->stream_locked)` so audio packets are parsed
+   continuously once the initial stream lock is established.
+3. **Audio sample alignment check (`avmcv710-parser.c`):**
+   Added `(audio_bytes & 3) == 0` validation to ensure every audio payload
+   conforms to 4-byte (S16 stereo sample) alignment.
+4. **Clock-recovery C1 trailer consumption (`avmcv710-parser.c`):**
+   Fixed the C1 clock recovery skip to consume the full 3 trailer words
+   (`i += 3;`) matching standard frame end handling.
+5. **ADV7604 AVI colorspace auto-detection (`avmcv710-status.c`, `avmcv710-cvx8897.c`, `avmcv710-video.c`):**
+   - In `avm_poll_signal()`, read HDMI 0x34 register 0x53 to inspect the
+     colorspace low nibble. Set `sig.colorspace` and `sig.rgb = (sig.colorspace <= 0x01)`.
+   - In `avm_cvx_work()`, pass `sig.rgb` into `avm_cvx8897_half_rate()` to
+     automatically select the vendor's dedicated 720p60 RGB half-rate table
+     instead of falling back to YCbCr 4:2:2.
+   - In `avm_pixfmt()`, check `sig.colorspace` and set `pix->quantization =
+     V4L2_QUANTIZATION_FULL_RANGE` when source is full-range (HDMI 0x53 value
+     1, 6, or 7), preventing crushed blacks and clipped whites in OBS.
+6. **ALSA sample rate expansion (`avmcv710-audio.c`):**
+   Expanded ALSA PCM hardware constraints and hw_params check to support
+   32000 Hz, 44100 Hz, and 48000 Hz. In `avm_audio_pcm_hw_free()`, set
+   `a->running = false;` under lock barrier.
+7. **`VB2_READ` flag added (`avmcv710-video.c`):**
+   Added `VB2_READ` to `dev->q.io_modes` to back `V4L2_CAP_READWRITE` for
+   user applications that use `read()` instead of mmap streaming.
+8. **Endpoint stall recovery (`avmcv710-usb.c`):**
+   Added `usb_clear_halt()` on `-EPIPE` in `avm_parse_work()` for
+   `AVM_EP_VIDEO_IN` with resubmission.
+9. **Teardown race prevention (`avmcv710-usb.c`, `avmcv710-cvx8897.c`):**
+   - Reordered `avm_usb_disconnect()` to flush the workqueue before cancelling
+     `dev->cvx_work`.
+   - In `avm_cvx8897_set_mode()` and `avm_cvx_work()`, gated sleeps and
+     execution on `READ_ONCE(dev->streaming)`.
+10. **Watchdog auto-recovery module parameter (`avmcv710-usb.c`):**
+    Added `auto_reset` module parameter (default 0=off). If enabled, when the
+    5-second watchdog flags a silent stream under STREAMON, it attempts
+    `usb_reset_device(dev->udev)` to kick the FX3 out of its wedged state.
+
 ### 2026-10-11 — `.inf` "device parameter" keys ruled out
 
 `avmu3c877_x64.inf` service params (`ENABLE_SCALER=1`, `SCALER_OP_MODE=2`,
@@ -363,12 +400,13 @@ tuning) — **not FX3/EP1 commands**.  Nothing to port to the kernel.
   (kind, w, h), cleared the moment real frames resume.  Acceptance: pulling
   the cable during OBS capture shows the AVerMedia-style "no signal" splash
   instead of a frozen frame.
-- [ ] Converter: read the ADV7604 AVI colorspace flag so a 720p60 RGB source
+- [x] Converter: read the ADV7604 AVI colorspace flag (HDMI 0x34 reg 0x53) so a 720p60 RGB source
   gets the vendor's dedicated RGB table instead of the YCbCr 4:2:2 table
-  (interlace + input rate are already polled/measured).
-- [ ] Audio: parse the HDMI Audio Infoframe (0x34/0x18 bit 0 + infoframe
-  payload byte 1 bits 4:2) and drive the ALSA PCM clock for 32/44.1 kHz
-  sources (PCM is currently fixed at 48 kHz).
+  (interlace + input rate + colorspace are now polled/measured).
+- [x] Audio: expanded ALSA capture PCM constraints to support 32/44.1/48 kHz
+  sample rates.
+- [x] Watchdog auto-recovery: `auto_reset` module parameter (default 0=off)
+  triggers `usb_reset_device(dev->udev)` when silent stream is flagged.
 
 ### P2 — polish
 

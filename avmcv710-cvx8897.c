@@ -92,12 +92,18 @@ int avm_cvx8897_set_mode(struct avm_device *dev, bool converted)
 	if (avm_pca9539_set_gpio(dev, AVM_PCA9539_PIN_RESET, true))
 		return -EIO;
 	msleep(AVM_CVX_RESET_DELAY_MS);
+	if (!READ_ONCE(dev->streaming))
+		return -ECANCELED;
 	if (avm_pca9539_set_gpio(dev, AVM_PCA9539_PIN_RESET, false))
 		return -EIO;
 	msleep(AVM_CVX_RESET_DELAY_MS);
+	if (!READ_ONCE(dev->streaming))
+		return -ECANCELED;
 	if (avm_pca9539_set_gpio(dev, AVM_PCA9539_PIN_RESET, true))
 		return -EIO;
 	msleep(AVM_CVX_RESET_DELAY_MS);
+	if (!READ_ONCE(dev->streaming))
+		return -ECANCELED;
 
 	if (avm_cvx_set_all_output_mode_bits(dev, !converted))
 		return -EIO;
@@ -192,10 +198,11 @@ static void avm_cvx_work(struct work_struct *work)
 	struct avm_parser *p = &dev->parser;
 	const u8 *table;
 	u32 w, h, in_fps, req, serial;
-	bool interlaced, want_half;
+	bool interlaced, want_half, rgb = false;
+	unsigned long flags;
 	int ret, failures;
 
-	if (!cvx8897)
+	if (!cvx8897 || !READ_ONCE(dev->streaming))
 		return;
 
 	w = READ_ONCE(p->active_w);
@@ -227,13 +234,17 @@ static void avm_cvx_work(struct work_struct *work)
 		    req * 2 <= in_fps + in_fps / 8;
 
 	/*
-	 * Assume YCbCr 4:2:2.  The RGB-vs-422 choice only matters for
-	 * 1280x720@60 (the vendor has a dedicated RGB table); distinguishing
-	 * them needs the ADV7604 AVI poll (Stage 2), so a 720p60 RGB source
-	 * gets the 422 table for now.
+	 * Select matching half-rate table.  Distinguish RGB vs YCbCr 4:2:2 via
+	 * the ADV7604 colorspace byte (HDMI 0x34 reg 0x53 low nibble: <= 1 is RGB)
+	 * so 720p60 RGB sources get the dedicated RGB table.
 	 */
+	spin_lock_irqsave(&dev->sig_lock, flags);
+	if (dev->sig.valid)
+		rgb = dev->sig.rgb;
+	spin_unlock_irqrestore(&dev->sig_lock, flags);
+
 	table = want_half ?
-		avm_cvx8897_half_rate(w, h, in_fps, false, interlaced) : NULL;
+		avm_cvx8897_half_rate(w, h, in_fps, rgb, interlaced) : NULL;
 	if (!table)
 		want_half = false;
 

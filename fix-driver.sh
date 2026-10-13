@@ -19,7 +19,7 @@ set -u
 
 MOD="avmcv710"
 DRV="/sys/bus/usb/drivers/$MOD"
-EXPECTED_SRC="8BCD3E74B4636369D14CDFE"   # bug-hunt fixes (see docs/DEVLOG.md 2026-10-13)
+EXPECTED_SRC="FDD5C386045BA50242DA9A3"   # bug-hunt fixes (see docs/DEVLOG.md 2026-10-13)
 
 [ "$(id -u)" -eq 0 ] || { echo "run as root (sudo ./fix-driver.sh)"; exit 1; }
 

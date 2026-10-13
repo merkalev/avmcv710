@@ -317,6 +317,16 @@ Session: finishing work on the kernel driver, cross-verifying with `cv710userspa
     Added `auto_reset` module parameter (default 0=off). If enabled, when the
     5-second watchdog flags a silent stream under STREAMON, it attempts
     `usb_reset_device(dev->udev)` to kick the FX3 out of its wedged state.
+11. **ALSA cyclic buffer alignment, pointer bounds & pause/resume (`avmcv710-audio.c`):**
+    - Sized cyclic write buffer in `avm_audio_push()` using negotiated
+      `frames_to_bytes(rt, rt->buffer_size)` rather than the full preallocated
+      `rt->dma_bytes` (1 MB), preventing audio packets from being written outside
+      the active mmap'd ring buffer.
+    - Bound `avm_audio_pcm_pointer()` to strictly return `< rt->buffer_size` frames.
+    - Added `snd_pcm_hw_constraint_integer(subs->runtime, SNDRV_PCM_HW_PARAM_PERIODS)`
+      to ensure period boundaries align with cyclic buffer wraps.
+    - Added `SNDRV_PCM_INFO_PAUSE | SNDRV_PCM_INFO_RESUME` flags and handled
+      `TRIGGER_PAUSE_RELEASE` and `TRIGGER_RESUME`.
 
 ### 2026-10-11 — `.inf` "device parameter" keys ruled out
 
@@ -413,7 +423,7 @@ tuning) — **not FX3/EP1 commands**.  Nothing to port to the kernel.
 - [ ] Overlay pump (needs TODO-2): splice 640×480 BMP (generated
   `avmcv710-bmp.h` already tracked locally) into the stream after
   idle-window, mirroring standby behavior.
-- [ ] Wire `SNDRV_PCM_INFO_RESUME`-safe suspend/resume for audio.
+- [x] Wire `SNDRV_PCM_INFO_RESUME`-safe suspend/resume for audio.
 - [ ] HDCP: keep documentation-only, but log the ADV7604 HDCP state read.
 
 ### Never (documented divergence)

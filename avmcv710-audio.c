@@ -87,7 +87,8 @@ static void avm_audio_card_free(struct snd_card *card)
 
 static const struct snd_pcm_hardware avm_audio_hw = {
 	.info = SNDRV_PCM_INFO_MMAP | SNDRV_PCM_INFO_MMAP_VALID |
-		SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_BLOCK_TRANSFER,
+		SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_BLOCK_TRANSFER |
+		SNDRV_PCM_INFO_PAUSE | SNDRV_PCM_INFO_RESUME,
 	.formats = SNDRV_PCM_FMTBIT_S16_LE,
 	.rates = SNDRV_PCM_RATE_32000 | SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000,
 	.rate_min = 32000,
@@ -116,6 +117,8 @@ static int avm_audio_pcm_open(struct snd_pcm_substream *subs)
 	spin_unlock_irqrestore(&a->lock, flags);
 
 	subs->runtime->hw = avm_audio_hw;
+	snd_pcm_hw_constraint_integer(subs->runtime,
+				      SNDRV_PCM_HW_PARAM_PERIODS);
 	/* payload and period sizes stay frame-aligned (4 B S16LE stereo) */
 	snd_pcm_hw_constraint_step(subs->runtime, 0,
 				   SNDRV_PCM_HW_PARAM_PERIOD_BYTES, 4);
@@ -190,6 +193,12 @@ static int avm_audio_pcm_trigger(struct snd_pcm_substream *subs, int cmd)
 		a->running = false;
 		spin_unlock_irqrestore(&a->lock, flags);
 		return 0;
+	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+	case SNDRV_PCM_TRIGGER_RESUME:
+		spin_lock_irqsave(&a->lock, flags);
+		a->running = true;
+		spin_unlock_irqrestore(&a->lock, flags);
+		return 0;
 	default:
 		return -EINVAL;
 	}
@@ -199,13 +208,20 @@ static snd_pcm_uframes_t avm_audio_pcm_pointer(struct snd_pcm_substream *subs)
 {
 	struct avm_audio *a = snd_pcm_substream_chip(subs);
 	struct snd_pcm_runtime *rt = subs->runtime;
-	u32 pos;
+	snd_pcm_uframes_t frames;
+	u32 pos, bsize;
 
 	/* frame_bits is only set once hw_params ran; nothing to report before */
-	if (!rt->frame_bits || !rt->dma_bytes)
+	if (!rt->frame_bits || !rt->buffer_size)
 		return 0;
-	pos = (u32)(READ_ONCE(a->base) % rt->dma_bytes);
-	return bytes_to_frames(rt, pos);
+	bsize = frames_to_bytes(rt, rt->buffer_size);
+	if (!bsize)
+		return 0;
+	pos = (u32)(READ_ONCE(a->base) % bsize);
+	frames = bytes_to_frames(rt, pos);
+	if (frames >= rt->buffer_size)
+		frames = 0;
+	return frames;
 }
 
 static int avm_audio_pcm_hw_free(struct snd_pcm_substream *subs)
@@ -260,13 +276,20 @@ void avm_audio_push(struct avm_device *dev, const u8 *src, u32 bytes)
 	}
 	subs = a->substream;
 	rt = subs->runtime;
-	if (!rt || !rt->dma_area || !rt->dma_bytes) {
+	if (!rt || !rt->dma_area || !rt->buffer_size) {
 		a->missed += bytes;
 		spin_unlock_irqrestore(&a->lock, flags);
 		return;
 	}
-	/* one packet (max 8192 B) can never exceed the 1 MB buffer */
-	size = rt->dma_bytes;
+	/* Use negotiated cyclic buffer size in bytes */
+	size = frames_to_bytes(rt, rt->buffer_size);
+	if (!size || (rt->dma_bytes && size > rt->dma_bytes))
+		size = rt->dma_bytes;
+	if (!size) {
+		a->missed += bytes;
+		spin_unlock_irqrestore(&a->lock, flags);
+		return;
+	}
 	if (bytes > size) {
 		a->overruns += bytes;
 		spin_unlock_irqrestore(&a->lock, flags);

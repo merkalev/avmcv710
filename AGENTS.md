@@ -280,10 +280,10 @@ Decision tree (implement based ONLY on the result):
 | — | Converter RGB-vs-422 (AVI colorspace flag) | ✅ auto-detected via HDMI 0x34 reg 0x53 (720p60 RGB table selected) |
 | — | Audio sample rates (32/44.1/48 kHz) | ✅ ALSA PCM constraints and hw_params expanded |
 | — | HDCP state log (doc-only) | open (P2, docs only) |
-| — | Suspend/resume safe audio | open (P2) |
+| — | Suspend/resume safe audio | ✅ SNDRV_PCM_INFO_PAUSE/RESUME, trigger ops, buffer_size ring alignment |
 
 Current module identity (for regression diffing): `srcversion
-8BCD3E74B4636369D14CDFE` (bug-hunt fixes, 2026-10-13 — see
+FDD5C386045BA50242DA9A3` (bug-hunt fixes, 2026-10-13 — see
 `docs/DEVLOG.md` "### 2026-10-13"), parms `cvx8897`, `avm_audio`
 (bool, default off), `avm_audio_index`, `avm_audio_id`, `auto_reset`
 (bool, default off), `softdep: pre: snd-pcm`, 4×2 MB URBs.  `fix-driver.sh`

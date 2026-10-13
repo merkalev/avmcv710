@@ -85,6 +85,16 @@ if lsmod | grep -q "^$MOD "; then
 fi
 
 # --- 5. load the freshly installed module (audio off unless asked) ---------
+kver="$(uname -r)"
+if [ -f "./avmcv710.ko.zst" ]; then
+	if [ ! -f "/lib/modules/$kver/updates/avmcv710.ko.zst" ] || [ "./avmcv710.ko.zst" -nt "/lib/modules/$kver/updates/avmcv710.ko.zst" ]; then
+		echo "installing ./avmcv710.ko.zst to /lib/modules/$kver/updates/..."
+		mkdir -p "/lib/modules/$kver/updates"
+		cp -f "./avmcv710.ko.zst" "/lib/modules/$kver/updates/"
+		depmod "$kver"
+	fi
+fi
+
 echo "loading $MOD $* ..."
 modprobe "$MOD" "$@" || fail "modprobe $MOD $* failed"
 sleep 1

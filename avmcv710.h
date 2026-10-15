@@ -168,15 +168,6 @@ struct avm_signal {
 	u32 poll_failures;	/* consecutive failed polls */
 };
 
-/* Overlay bitmap shown when the input is unavailable / unusable. */
-enum avm_splash {
-	AVM_SPLASH_NONE = 0,
-	AVM_SPLASH_NO_SIGNAL,
-	AVM_SPLASH_OUT_OF_RANGE,
-	AVM_SPLASH_HDCP,
-	AVM_SPLASH_CONTENT_PROTECTION,
-};
-
 struct avm_buffer {
 	struct vb2_v4l2_buffer vb;	/* must be first */
 	struct list_head list;
@@ -208,17 +199,10 @@ struct avm_device {
 	unsigned int pending_bufs;
 	struct avm_parser parser;
 
-	/* ADV7604 poll + standby overlay pump (avmcv710-status.c).  The work
-	 * is armed only while streaming (start/stop bracket it), so no
-	 * receiver I2C is issued while the FPGA link is idle. */
+	/* ADV7604 telemetry poll (avmcv710-status.c). Armed only while streaming. */
 	spinlock_t sig_lock;		/* protects dev->sig */
 	struct avm_signal sig;
 	struct delayed_work status_work;
-	u32 status_tick;		/* ticks since the work was (re)armed */
-	enum avm_splash splash;		/* overlay currently shown */
-	enum avm_splash splash_cached;	/* bitmap held in splash_frame */
-	u8 *splash_frame;		/* AVM_FRAME_BPF composited overlay */
-	u32 splash_w, splash_h, splash_words;
 	bool status_inited;		/* work initialized (probe err-path guard) */
 
 	/* ALSA capture PCM (avmcv710-audio.c): the parser pushes 0x58 audio
@@ -281,7 +265,7 @@ int avm_status_init(struct avm_device *dev);
 void avm_status_fini(struct avm_device *dev);
 void avm_status_start(struct avm_device *dev);
 void avm_status_stop(struct avm_device *dev);
-const u8 *avm_splash_bmp(enum avm_splash kind, u32 *words);
+
 
 /* avmcv710-usb.c */
 void avm_return_buffers(struct avm_device *dev, enum vb2_buffer_state state);

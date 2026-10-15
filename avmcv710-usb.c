@@ -474,9 +474,18 @@ static void avm_usb_disconnect(struct usb_interface *intf)
 	dev->streaming = false;
 	mutex_unlock(&dev->stream_lock);
 
-	/* Stop the receiver poll / overlay pump before tearing down URBs so
-	 * no I2C read can touch the device mid-disconnect. */
+	/* Stop the receiver telemetry poll before tearing down URBs */
 	avm_status_stop(dev);
+
+	/*
+	 * Park the FPGA (stop producing frames) and reset FX3 stream DMA
+	 * *before* killing the EP 0x83 video URBs, mirroring UsbStream::shutdownStream.
+	 * Killing URBs while the FPGA is actively transmitting leaves the FX3
+	 * mid-DMA with nowhere to drain, wedging EP1 and causing all future
+	 * bootstrap/control commands to timeout (-110) on subsequent probes.
+	 */
+	avm_fpga_work_mode(dev, false);
+	avm_reset_stream_dma(dev);
 
 	usb_kill_anchored_urbs(&dev->urb_anchor);
 	cancel_delayed_work_sync(&dev->watch_work);

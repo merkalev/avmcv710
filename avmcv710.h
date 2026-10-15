@@ -142,9 +142,8 @@ struct avm_parser {
 	 * must not share a static scratch mode. */
 	struct avm_mode meas;
 
-	/* liveness / pacing: last time real frame data was seen, and the
-	 * rolling frame rate (used to pace the no-signal/out-of-range
-	 * splash and to answer g/s_parm) */
+	/* liveness / pacing: last time real frame data was seen (diagnostic
+	 * stamp), and the rolling frame rate (used to answer g/s_parm) */
 	ktime_t last_real_kt;
 	ktime_t fps_t0;
 	u32 fps_cnt;

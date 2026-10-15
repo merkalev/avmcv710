@@ -19,14 +19,16 @@ the extracted vendor driver and the community userspace port rather than
 guesses.
 
 **The driver is feature-complete for video/audio/hardware-conversion.**  The
-last three tickets (TODO-1 audio, TODO-2 ADV7604 poll, TODO-3 overlays) are
-written and committed.  The first install of TODO-2/3's module oopsed the
+tickets (TODO-1 audio, TODO-2 ADV7604 poll, TODO-3 overlays) were written and
+committed — but **TODO-3 overlays were removed again on 2026-10-15** with the
+streamlined rewrite (see DEVLOG).  The first install of TODO-2/3's module
+oopsed the
 kernel through the never-hardware-tested ALSA card (TODO-1): the PCM had no
 `ops->prepare`, this kernel calls it unconditionally, and WirePlumber's
 prepare of the new card was a NULL instruction fetch that collapsed system
 audio.  That is **fixed and committed** and audio is now opt-in
 (`avm_audio=1`, default off = the previously stable video-only module); the
-user still must verify TODO-1/2/3 on hardware (the agent cannot `sudo`).
+user still must verify TODO-1/2 on hardware (the agent cannot `sudo`).
 
 Then a full bug hunt ("go hunt for all problems in the driver") found and
 fixed **8 more bugs** on 2026-10-12 (devlog entry `### 2026-10-12 (late)`):
@@ -54,9 +56,9 @@ based on the experiment result** — not to rewrite anything.
 │   ├── avmcv710-usb.c        # probe/disconnect/release, URB lifecycle, watchdog
 │   ├── avmcv710-cvx8897.c    # CVX8897 frame-rate converter (opt-in)
 │   ├── avmcv710-audio.c      # ALSA card "AVMCV710" capture PCM (TODO-1)
-│   ├── avmcv710-status.c     # ADV7604 poll + no-signal overlay pump (TODO-2/3)
+│   ├── avmcv710-status.c     # ADV7604 telemetry poll (1 Hz, streaming only)
 │   ├── avmcv710-bootstrap.h  # TRACKED: pre-parsed 871-command bootstrap table
-│   ├── avmcv710-bmp.h        # GENERATED (gitignored): 4x 640x480 YUY2 overlays
+│   ├── (removed) avmcv710-bmp.h   # overlay BMPs deleted 2026-10-15 (see DEVLOG)
 │   ├── avmcv710-cvx8897.h    # GENERATED (gitignored): 251 regs x 14 modes
 │   ├── docs/DEVLOG.md        # parity matrix, dated RE ledger, TODO with acceptance
 │   ├── docs/AGENTS.md        # this handoff document
@@ -69,9 +71,11 @@ based on the experiment result** — not to rewrite anything.
 ```
 
 Git notes: all commits since `09a144b` are **local only, nothing pushed**.
-`avmcv710-bmp.h` and `avmcv710-cvx8897.h` are gitignored (regenerate with
-`python3 tools/gen_bmp.py` / `tools/gen_cvx8897.py` only if the build asks
-for them); `avmcv710-bootstrap.h` **is** tracked.
+`avmcv710-cvx8897.h` is gitignored (regenerate with
+`python3 tools/gen_cvx8897.py` only if the build asks for it);
+`avmcv710-bootstrap.h` **is** tracked.  `avmcv710-bmp.h` was removed with the
+overlay subsystem on 2026-10-15; `tools/gen_bmp.py` still exists but nothing
+builds it anymore (the build no longer references it).
 
 ## 2. Build / install / test (agent cannot sudo — user does install)
 
@@ -115,16 +119,13 @@ never exercised in the broken session.
    # then: OBS records video+audio; /tmp/a.wav plays back in sync;
    # the rest of the system keeps producing audio (no WirePlumber collapse)
    ```
-2. **TODO-2 ADV7604 poll + TODO-3 overlays** (`482fed3` + `7ebb4b6`) — start
-   OBS capture and watch `journalctl -k -f`:
-   - `avmcv710: STREAMON: ...` then ~100–200 ms later
-     `signal: TMDS locked 1920x1080` (or whatever the source is) —
-     **proves the poll works**.
-   - Pull the HDMI cable while recording → ≤250 ms later OBS shows the
-     AVerMedia-style "no signal" splash and the journal logs
-     `no video: showing no-signal overlay 1920x1080` (or the out-of-range
-     variant).  Replug → `video resumed; overlay cleared` + a fresh
-     `signal: TMDS locked`.
+2. **TODO-2 ADV7604 poll** — start OBS capture and watch `journalctl -k -f`:
+   - `avmcv710: STREAMON: ...` then ~1 s later
+     `[ADV7604] TMDS LOCKED (IO 0x6A=.., 0x12=.., 1920x1080p cs=..)` (or
+     whatever the source is) — **proves the poll works**.
+   - Pull the HDMI cable while recording → the journal shows the TMDS
+     UNLOCKED line within ~1 s.  (The old TODO-3 "no signal" overlay was
+     **removed 2026-10-15**; there is no splash anymore — see DEVLOG.)
    - **Probing failure symptoms to watch for:** a stream of
      `i2c read .. failed` lines would mean EP1 wedged again; report them.
 3. **Converter** (older, already tested once but re-verify after the new
@@ -224,11 +225,11 @@ Decision tree (implement based ONLY on the result):
   bit 4), HDMI 0x34/0x07+0x09 (12-bit W/H), publishes `dev->sig` under
   `sig_lock`.  `avm_live_geometry()` (shared by `avm_pixfmt`) falls back to
   `dev->sig` before the first frame locks, then 1920x1080.
-- **Overlays (TODO-3):** after 250 ms without a real frame the status work
-  composites the 640x480 no-signal/out-of-range bitmap centered on a
-  limited-range black raster at the live geometry and delivers it through the
-  normal vb2 path.  (The vendor draws its splash host-side; a bare V4L2 node
-  synthesizes it instead — documented divergence.)
+- **Overlays (TODO-3): REMOVED 2026-10-15.** The status worker no longer
+  composites or delivers a standby image; the 640x480 bitmap subsystem and
+  `avmcv710-bmp.h` were deleted (bloat).  The receiver worker is telemetry
+  only.  The vendor draws its splash host-side; re-adding it is tracked in
+  `docs/DEVLOG.md` (parity matrix = regression).
 - **Audio (TODO-1), opt-in `avm_audio=1`:** snd-usb-audio push model — parser
   copies 0x58 payload into the PCM DMA buffer, `pointer()` reports the write
   cursor, PCM flagged non-atomic, `snd_pcm_period_elapsed` fired from the
@@ -283,8 +284,11 @@ Decision tree (implement based ONLY on the result):
 |---|--------|-------|
 | TODO-1 | ALSA capture PCM | built + committed `aa16708` + oops fix (opt-in `avm_audio=1`) — **user test pending** |
 | TODO-2 | ADV7604 status poll | built + committed `482fed3`,`7ebb4b6` — **user test pending** |
-| TODO-3 | No-signal/out-of-range overlays | built + committed `482fed3` — **user test pending** |
+| TODO-3 | No-signal/out-of-range overlays | **removed 2026-10-15** (splash subsystem deleted; DEVLOG parity matrix = regression) |
 | TODO-4 | Soft-reload / probe -110 timeout | probe timeout -110 after wedged EP1; auto-recovery module param `auto_reset` (default 0=off); test pending after replug |
+| PARSER-PAD | Short-frame pad-and-keep (vendor) vs drop (ours); replace invented `40000` floor | open — see DEVLOG `### P0 — vendor-parity gaps` (2026-10-15 RE) |
+| FRAMING-LAYER | Determine where the vendor parses C0/C1 (markers absent from `avmu3_x64.sys` / `libC875Driver.dylib`) | open |
+| BOOTSTRAP-PARITY | Diff 871-cmd replay vs `CRXADV7604`/`CLFE3` init in the `.sys` | open |
 | — | 2026-10-12 bug-hunt fixes (8 bugs: unload pin, adaptive-mode dead delivery, sequence race, adapter shared scratch mode, URB fail-path leak, status-work pre-init cancel, bootstrap scratch guard, audio hw_free barrier) | fixed + committed; see `### 2026-10-12 (late)` devlog entry |
 | — | 2026-10-13 bug-hunt & completion (DMA bounce buffers, inter-frame audio, alignment, colorspace auto-detection, ALSA 32k/44.1k/48k, EPIPE stall recovery, auto_reset watchdog) | fixed + compiled; see `### 2026-10-13` devlog entry |
 | — | Converter RGB-vs-422 (AVI colorspace flag) | ✅ auto-detected via HDMI 0x34 reg 0x53 (720p60 RGB table selected) |

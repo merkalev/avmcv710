@@ -245,8 +245,8 @@ void avm_parser_reset(struct avm_device *dev)
 	p->active_h = 0;
 	p->mode_serial = 0;
 	p->frame_sequence = 0;
-	/* a fresh stream must not instantly look "dead": mark now, so the
-	 * splash pump waits a full idle window before showing an overlay */
+	/* stamp a fresh stream as live; last_real_kt is diagnostic only since
+	 * the overlay pump was removed (2026-10-15) */
 	p->last_real_kt = ktime_get();
 	p->fps_t0 = 0;
 	p->fps_cnt = 0;
@@ -317,9 +317,8 @@ void avm_deliver_frame(struct avm_device *dev, const u8 *src, u32 words)
 		list_del_init(&buf->list);
 		dev->pending_bufs--;
 		/* Advance the sequence under the same lock that pops the
-		 * buffer: the splash pump also delivers through this list
-		 * from the status worker, and a concurrent frame would make
-		 * the two workers stamp duplicate sequence numbers. */
+		 * buffer so two concurrent deliverers cannot stamp duplicate
+		 * sequence numbers. */
 		buf->vb.sequence = p->frame_sequence++;
 	}
 	spin_unlock_irqrestore(&dev->urbs_lock, flags);
@@ -450,9 +449,9 @@ static void avm_handle_frame_end(struct avm_device *dev, u32 frame_words)
 		return;
 	}
 
-	/* Real video data reached a recognizable frame: feed the liveness
-	 * stamp used by the splash pump (a dying input stops updating it,
-	 * transitional drops still count as live data). */
+	/* Real video data reached a recognizable frame: refresh the liveness
+	 * stamp (diagnostic; a dying input stops updating it, transitional
+	 * drops still count as live data). */
 	WRITE_ONCE(p->last_real_kt, ktime_get());
 
 	/* Mode switch hysteresis: 4 consecutive same-geometry frames. */

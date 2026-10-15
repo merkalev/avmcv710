@@ -359,10 +359,10 @@ static int avm_usb_probe(struct usb_interface *intf,
 	avm_parser_reset(dev);
 
 	/*
-	 * ADV7604 status snapshot + standby overlay pump.  This only
-	 * initializes the worker and the overlay scratch buffer; the work is
-	 * armed later from start_streaming(), so no receiver I2C is issued
-	 * until frames are actually being captured.
+	 * ADV7604 status snapshot.  This only initializes the receiver
+	 * telemetry worker; the work is armed later from start_streaming(),
+	 * so no receiver I2C is issued until frames are actually being
+	 * captured.
 	 */
 	ret = avm_status_init(dev);
 	if (ret)

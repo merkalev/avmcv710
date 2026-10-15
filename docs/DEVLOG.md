@@ -32,9 +32,11 @@ Built, awaiting user install/test:
   between C1 and C0.
 - ADV7604 status poll (TODO-2): 10 Hz while streaming, publishes `dev->sig`
   (TMDS lock / interlace / measured geometry / colorspace / RGB)
-- No-signal + out-of-range overlays (TODO-3): 640×480 bitmap composited into
-  the current raster after an idle window, so no-signal is visible in OBS
-  at the negotiated geometry
+- **removed 2026-10-15** — the no-signal / out-of-range overlays (TODO-3)
+  were deleted with the splash subsystem in the streamlined rewrite (see the
+  2026-10-15 entry).  The receiver is now telemetry-only; a bare V4L2 node no
+  longer synthesizes the vendor's host-side splash.  Tracked as a parity
+  regression in the matrix below if it is to be re-added.
 - Full-range quantization auto-detection (prevents crushed blacks in OBS when
   HDMI 0x53 reports full range)
 - CVX8897 720p60 dedicated RGB half-rate table auto-selection via ADV7604 colorspace
@@ -53,9 +55,9 @@ Built, awaiting user install/test:
 | Res/fps change without restart | yes | yes (V4L2_EVENT_SOURCE_CHANGE) | ✅ |
 | "Video Input Frame Rate" 60/50/30/25 | CVX8897 | CVX8897, opt-in (RGB+YCbCr tables) | ✅ |
 | Audio S16LE stereo @ 32/44.1/48 kHz | yes (PCM) | ALSA capture PCM (`avmcv710-audio.c`), opt-in `avm_audio=1` | ✅ (test pending, opt-in) |
-| No-signal overlay | yes (BMP splice) | 640×480 BMP composited at live geometry | ✅ (test pending) |
-| Out-of-range overlay | yes | same | ✅ (test pending) |
-| Content-protection overlay | yes | same (HDCP doc only) | 🟡 doc |
+| No-signal overlay | yes (BMP splice) | **removed 2026-10-15** (was: 640×480 BMP composited at live geometry) | ❌ regression |
+| Out-of-range overlay | yes | **removed 2026-10-15** | ❌ regression |
+| Content-protection overlay | yes | removed 2026-10-15 (HDCP doc only) | 🟡 doc |
 | Receiver status (lock/RGB/rate) | ~10 Hz poll | 10 Hz poll while streaming → `dev->sig` | ✅ (test pending) |
 | Warm restart without replug | yes | watchdog diagnosis; opt-in `auto_reset=1` | 🟡 TODO-4 |
 | Clean unload (rmmod without replug) | n/a | unbind drops the ALSA pin in disconnect; rmmod succeeds | ✅ (fixed 2026-10-12) |
@@ -456,6 +458,46 @@ tuning) — **not FX3/EP1 commands**.  Nothing to port to the kernel.
   2. Test `auto_reset=1` or investigate safe probe-time recovery (e.g. `usb_reset_device` fallback or udev helper) so rmmod/modprobe recovers even if EP1 was wedged.
 
 
+### P0 — vendor-parity gaps from the 2026-10-15 RE of `avmu3_x64.sys`
+
+Context: quick disassembly of `driver_extracted/win/avmu3_x64.sys`
+(PE32+ x64, ~710 KB `.text`, **no COFF symbols** — only an RSDS CodeView path
+to a non-shipped PDB; names recovered from RTTI/format-string xrefs).  The
+macOS side ships `libC875Driver.dylib` (not `libC877Driver`).  These three
+items are to be done soon, in order of leverage.
+
+- [ ] **PARSER-PAD — short-frame pad-and-keep (vendor) vs drop (ours).**
+  The vendor allocates a `0x465000`-byte (= 4,608,000 = 1920×1200×2 =
+  `AVM_FRAME_BPF`) frame buffer and **pre-fills it word-by-word with
+  `0x80108010` (studio black)** before copying the receiver raster in
+  (`.text` @ `0x14001f878`), so a short / partial frame (HDMI re-lock,
+  non-exact timing) is delivered **black-padded**, not discarded.  Our
+  parser's CV-23 exact-size gate (`avmcv710-parser.c` `avm_handle_frame_end`)
+  drops any C1 whose word count ≠ the mode target instead.
+  Also: the `frame_words >= 40000` floor (`avmcv710-parser.c:675`) is
+  invented — the value `40000` / `0x9C40` occurs **nowhere** in the vendor
+  binary; it is not the vendor's `MINIMUM_VIDEO_FRAME_WORDS`.
+  Acceptance: a short frame during HDMI re-lock is delivered padded with
+  `0x80108010` (not dropped), matching `PROTOCOL.md` §3 (below the vendor
+  minimum ⇒ drop, otherwise pad to the frame buffer); bounds stay enforced
+  (never over-fill).  RE the vendor's minimum from `ParseAVerData` first.
+- [ ] **FRAMING-LAYER — where does the vendor parse C0/C1?**
+  The literal markers `C0FFFF00` / `C1FFFF00` / `58FFFF00` / `AA5555AA` do
+  **not** occur anywhere in `avmu3_x64.sys`, nor in the macOS
+  `libC875Driver.dylib`.  So the vendor kernel driver either compares them
+  non-literally, or framing is done by the FPGA firmware / user mode, not the
+  kernel driver.  If it is the latter, our in-kernel C0/C1 state machine is a
+  *different layer* and the "parity with the official driver" framing claims
+  must be restated.  Acceptance: a written determination of where the vendor
+  frames the stream, with the xrefs/disassembly that prove it.
+- [ ] **BOOTSTRAP-PARITY — 871-command replay vs `CRXADV7604`/`CLFE3` init.**
+  Diff our `avmcv710-bootstrap.h` trace against the vendor's
+  `CRXADV7604::HardwareInit` / `ConfigureRx` / `ADIAPI_TvInit` and the
+  `CLFE3` bring-up (`SetWorkMode`/`SetIdleMode`/`SetInterPattern`) to confirm
+  the write set and ordering (slaves `0x20`/`0x34`/`0x22`/`0x50`, the 22×
+  EDID writes) match, or document the intentional divergence.
+  (`CLFE3::SetInterPattern` and `SetPWMMode` have no kernel counterpart.)
+
 ### P1 — correctness of what we already have
 
 - [x] **TODO-2 ADV7604 status poll (Stage 2)** — `avmcv710-status.c` (recovered
@@ -468,16 +510,18 @@ tuning) — **not FX3/EP1 commands**.  Nothing to port to the kernel.
   measured 12-bit geometry) under `sig_lock`; `dev->sig` already feeds the
   parser fallback geometry, and interlace/`measured_fps` feed the converter.
   Acceptance: `journalctl -k` shows the ADV7604 lock, and pulling the HDMI
-  cable flips the overlay (below).
-- [x] **TODO-3 overlays** — same file: when streaming and no real frame has
-  arrived for a 250 ms idle window, the work composites the 640×480
-  no-signal / out-of-range bitmap (generated `avmcv710-bmp.h`) centred on a
-  limited-range black raster at the *live* geometry (`avm_live_geometry()`,
-  shared with `avm_pixfmt()` so consumers see the size they negotiated) and
-  delivers it via `avm_deliver_frame()` — paced at the ~30 Hz tick, cached by
-  (kind, w, h), cleared the moment real frames resume.  Acceptance: pulling
-  the cable during OBS capture shows the AVerMedia-style "no signal" splash
-  instead of a frozen frame.
+  cable logs the TMDS UNLOCKED line within ~1 s.
+- [ ] **TODO-3 overlays — REMOVED 2026-10-15.** The overlay/splash subsystem
+  (640×480 BITMAP composite delivered through `avm_deliver_frame()`, the
+  `avm_splash_bmp()` accessor, the `avm_splash` enum, and the generated
+  14.8 MB `avmcv710-bmp.h`) was deleted in the streamlined rewrite; the
+  receiver worker is now telemetry-only (1 Hz ADV7604 poll) and no longer
+  synthesizes a standby image.  The vendor draws its splash host-side, so a
+  bare V4L2 node has no equivalent; re-adding it (host-side renderer, or an
+  OBS-side standby in the consumer) is deferred and tracked in the parity
+  matrix as a regression.  The `aver_custom_{no_signal,out_of_range,hdcp,
+  content_protection}.bmp` files in `driver_extracted/win/` are the vendor
+  bitmaps if a faithful re-add is ever wanted.
 - [x] Converter: read the ADV7604 AVI colorspace flag (HDMI 0x34 reg 0x53) so a 720p60 RGB source
   gets the vendor's dedicated RGB table instead of the YCbCr 4:2:2 table
   (interlace + input rate + colorspace are now polled/measured).
@@ -488,9 +532,9 @@ tuning) — **not FX3/EP1 commands**.  Nothing to port to the kernel.
 
 ### P2 — polish
 
-- [ ] Overlay pump (needs TODO-2): splice 640×480 BMP (generated
-  `avmcv710-bmp.h` already tracked locally) into the stream after
-  idle-window, mirroring standby behavior.
+- [ ] Overlay pump — **removed 2026-10-15** (see TODO-3 above); re-add only if
+  a host-side standby is wanted.  `driver_extracted/win/aver_custom_*.bmp`
+  are the vendor bitmaps.
 - [x] Wire `SNDRV_PCM_INFO_RESUME`-safe suspend/resume for audio.
 - [ ] HDCP: keep documentation-only, but log the ADV7604 HDCP state read.
 

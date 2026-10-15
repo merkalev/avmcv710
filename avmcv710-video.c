@@ -75,9 +75,8 @@ static int avm_enum_fmt(struct file *file, void *fh,
  * geometry: the receiver may report only the field height for interlaced
  * input, so double a short (< 700) measured height.
  *
- * Shared with the overlay pump (avmcv710-status.c) so a synthesized
- * no-signal frame is composited at exactly the geometry consumers were told
- * to expect. */
+ * The receiver poll (avmcv710-status.c) publishes the same geometry so the
+ * parser fallback and the format negotiation agree. */
 void avm_live_geometry(struct avm_device *dev, u32 *w, u32 *h)
 {
 	u32 ww = READ_ONCE(dev->parser.active_w);
@@ -512,8 +511,8 @@ static int avm_start_streaming(struct vb2_queue *q, unsigned int count)
 			 "FPGA/DMA start command failed: %d (streaming anyway)\n",
 			 ret);
 
-	/* Now that the FPGA is producing, arm the receiver poll + overlay
-	 * pump (avmcv710-status.c).  Arming here, not in probe, is what keeps
+	/* Now that the FPGA is producing, arm the receiver telemetry poll
+	 * (avmcv710-status.c).  Arming here, not in probe, is what keeps
 	 * the ADV7604 I2C off the idle link (polling an idle FX3 wedged EP1). */
 	avm_status_start(dev);
 
@@ -543,7 +542,7 @@ static void avm_stop_streaming(struct vb2_queue *q)
 	/* vb2 core holds q->lock (== stream_lock) while calling this. */
 	WRITE_ONCE(dev->streaming, false);
 
-	/* Cancel the receiver poll / overlay pump first: the worker stops
+	/* Cancel the receiver telemetry poll first: the worker stops
 	 * re-arming as soon as streaming clears, and this waits out any
 	 * in-flight I2C read before we park the FPGA below. */
 	avm_status_stop(dev);

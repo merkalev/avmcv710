@@ -267,7 +267,33 @@ and — when the old build's invisible stray ref survives — prints the
 deliberate `sudo rmmod -f avmcv710 && sudo modprobe avmcv710` escape hatch
 instead of failing silently.
 
+### 2026-10-15 — streamlined rewrite: bloat elimination, disconnect park fix, clean 1Hz telemetry
+
+Session: clean-slate redesign based on lessons from `cv710userspace` and hardware analysis.
+
+1. **Root cause of soft-reload probe timeout `-110` resolved (`avmcv710-usb.c`):**
+   - **Mechanism:** In `avm_usb_disconnect()`, unbinding the driver killed the EP 0x83
+     video URBs *without* parking the FPGA (`avm_fpga_work_mode(dev, false)`) or
+     resetting stream DMA (`avm_reset_stream_dma(dev)`). This left the Cypress FX3
+     GPIF II controller stuck mid-DMA trying to push pixels with no host buffer, wedging
+     the FX3 ARM9 firmware and locking up EP1. When the driver was reloaded moments later,
+     `avm_bootstrap()` timed out across all retries after 35 seconds with `-110`.
+   - **Fix:** `avm_usb_disconnect()` now symmetrically parks the FPGA and resets FX3 stream
+     DMA *before* killing URBs, exactly matching `avm_stop_streaming()` and `UsbStream::shutdownStream`.
+2. **In-kernel splash bloat elimination (`avmcv710-status.c`, `avmcv710.h`):**
+   - Deleted the generated 14.8 MB `avmcv710-bmp.h` header containing raw BMP arrays.
+   - Removed 4.6 MB per-device `splash_frame` kernel heap allocation.
+   - Replaced 33 Hz timer overlay pump with a clean, low-overhead 1 Hz receiver telemetry
+     poller (`avmcv710-status.c`) that monitors TMDS lock, geometry, and colorspace without
+     interfering with video streaming or wedging the EP1 control pipe.
+   - Module `.ko` size dropped from 5.4 MB down to 2.8 MB (compressed 632 KiB).
+3. **Running kernel 7.2.9 native compilation:**
+   - Compiled cleanly against `/lib/modules/7.2.9-2-cachyos/build` with Clang/LLVM (`LLVM=1`).
+   - Module `srcversion DD67527A5AD86CE6D3F925C`, `vermagic: 7.2.9-2-cachyos SMP preempt mod_unload`.
+   - Updated `fix-driver.sh` with the new expected srcversion.
+
 ### 2026-10-13 — audio framing, DMA bounce buffers, colorspace detection, auto_reset watchdog
+
 
 Session: finishing work on the kernel driver, cross-verifying with `cv710userspace` and hardware specifications.
 

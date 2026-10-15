@@ -293,10 +293,11 @@ Decision tree (implement based ONLY on the result):
 | — | Suspend/resume safe audio | ✅ SNDRV_PCM_INFO_PAUSE/RESUME, trigger ops, buffer_size ring alignment |
 
 Current module identity (for regression diffing): `srcversion
-2145330CDFFA01136FC5281` (bug-hunt fixes, 2026-10-13 — see
-`docs/DEVLOG.md` "### 2026-10-13"), parms `cvx8897`, `avm_audio`
+DD67527A5AD86CE6D3F925C` (streamlined rewrite, 2026-10-15 — see
+`docs/DEVLOG.md` "### 2026-10-15"), parms `cvx8897`, `avm_audio`
 (bool, default off), `avm_audio_index`, `avm_audio_id`, `auto_reset`
 (bool, default off), `softdep: pre: snd-pcm`, 4×2 MB URBs.  `fix-driver.sh`
+
 expects this srcversion and prints the `rmmod -f` escape hatch if an
 old build's stray ref survives unbind.
 

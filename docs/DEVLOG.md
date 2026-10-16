@@ -52,6 +52,7 @@ Built, awaiting user install/test:
 | --- | --- | --- | --- |
 | Video capture @ source rate | yes | yes | ✅ |
 | Geometry resets passthrough | yes (Scaler off by default) | yes (never scales) | ✅ |
+| Short/partial frame (re-lock) | kept, black-padded `0x80108010` | kept, black-padded (`AVM_PAD_WORD`) | ✅ (test pending) |
 | Res/fps change without restart | yes | yes (V4L2_EVENT_SOURCE_CHANGE) | ✅ |
 | "Video Input Frame Rate" 60/50/30/25 | CVX8897 | CVX8897, opt-in (RGB+YCbCr tables) | ✅ |
 | Audio S16LE stereo @ 32/44.1/48 kHz | yes (PCM) | ALSA capture PCM (`avmcv710-audio.c`), opt-in `avm_audio=1` | ✅ (test pending, opt-in) |
@@ -269,6 +270,54 @@ and — when the old build's invisible stray ref survives — prints the
 deliberate `sudo rmmod -f avmcv710 && sudo modprobe avmcv710` escape hatch
 instead of failing silently.
 
+### 2026-10-16 — PARSER-PAD: short frames black-padded, not dropped (vendor parity)
+
+Fixes the P0 `PARSER-PAD` item from the vendor RE below.
+
+**RE provenance.**  `driver_extracted/mac/…/Resources/libC877Driver.dylib` is
+the CV710 macOS capture driver and, unlike `avmu3_x64.sys` (stripped, CodeView
+PDB not shipped), it **retains its symbol table** (`ParseAVerData`,
+`VideoParseBuffer`, `Device`, …).  Disassembling `__text` (extract the section,
+`objdump -D -b binary -m i386`) gives the real framing:
+
+- `ParseAVerData::updateVideoStartInfo` (C0) validates exactly like ours:
+  `(b0+b1+b2-0x40)&0xFF == b3` **and** `b1 == 0x01`.
+- `ParseAVerData::updateVideoEndInfo` (C1) validates
+  `(b0+b1+b2+b3+0xC1)&0xFF == b4` (i.e. `-0x3F`) **and** `b0 == last_seq`.
+  Note it does *not* separately test `b1==0x02`/`b3==0x38`; `0x38` is folded
+  into the checksum.  Our extra `tb1==0x02` test is stricter but harmless.
+- `Device::initDevice` and `Device::InitialOverlayScreen` **pre-fill the frame
+  buffer with `0x80108010`** (legal YUY2 studio black: Y=16,U=128,Y=16,V=128)
+  and the parser copies the received raster over the top.  A frame that lost
+  lines therefore comes out **black-padded — the vendor does not drop it**.
+- `PROTOCOL.md` §3 states the same rule (short frames ≥ `MINIMUM_VIDEO_FRAME_WORDS`
+  padded with `0x80108010`; below the minimum dropped).
+
+**Change** (`avmcv710-parser.c`, `avmcv710.h`, `avmcv710-video.c`):
+- New `AVM_PAD_WORD 0x80108010u` and `avm_reconcile_frame()`: a C1 whose word
+  count lands in the locked mode's detection window is presented at exactly
+  `mode->target` words — a short frame gets an `AVM_PAD_WORD` tail, a long one
+  is truncated.  Word counts outside every mode window are still corruption and
+  are dropped (CV-23 bounds are untouched).
+- The interlaced path reconciles the **field** to the field target *before*
+  weaving, which also removes the stale-row weave that a short field could
+  have produced (the previous exact-size gate hid it).
+- Removed the invented `frame_words >= 40000` floor: the mode detector's
+  per-mode windows are the real gate.  (`40000` / `0x9C40` occurs **nowhere**
+  in either vendor binary.)
+- New `padded_frames` counter, reported in the stop `dev_dbg` and via a
+  ratelimited `short frame: N/M words, black-padded` log.
+
+**Caveat.**  The vendor's exact `MINIMUM_VIDEO_FRAME_WORDS` was not recoverable
+as a single constant in the disassembly, so the gate is `avm_detect_mode()`'s
+per-mode window (±~2.5 % / 64 words) — at least as conservative.  A count that
+does not land in any window is still dropped.
+
+**Acceptance (user test).**  With a marginal HDMI source (or a mid-recording
+re-lock) OBS shows a black-padded frame instead of a frozen one; `journalctl -k`
+shows at most a ratelimited `short frame: … black-padded`.  No regression on a
+clean 1080p60 source: every frame is exact, `padded_frames` stays 0.
+
 ### 2026-10-15 — streamlined rewrite: bloat elimination, disconnect park fix, clean 1Hz telemetry
 
 Session: clean-slate redesign based on lessons from `cv710userspace` and hardware analysis.
@@ -462,34 +511,33 @@ tuning) — **not FX3/EP1 commands**.  Nothing to port to the kernel.
 
 Context: quick disassembly of `driver_extracted/win/avmu3_x64.sys`
 (PE32+ x64, ~710 KB `.text`, **no COFF symbols** — only an RSDS CodeView path
-to a non-shipped PDB; names recovered from RTTI/format-string xrefs).  The
-macOS side ships `libC875Driver.dylib` (not `libC877Driver`).  These three
-items are to be done soon, in order of leverage.
+to a non-shipped PDB; names recovered from RTTI/format-string xrefs) **and**
+`driver_extracted/mac/…/Resources/libC877Driver.dylib` (Mach-O i386, but with
+its **symbol table intact** — `ParseAVerData`, `VideoParseBuffer`, `Device`;
+disassemble the `__text` section as raw i386).  The readable mac driver is the
+better framing source of truth.  (Both `libC875Driver` and `libC877Driver`
+ship; C877 is the CV710.)
 
-- [ ] **PARSER-PAD — short-frame pad-and-keep (vendor) vs drop (ours).**
-  The vendor allocates a `0x465000`-byte (= 4,608,000 = 1920×1200×2 =
-  `AVM_FRAME_BPF`) frame buffer and **pre-fills it word-by-word with
-  `0x80108010` (studio black)** before copying the receiver raster in
-  (`.text` @ `0x14001f878`), so a short / partial frame (HDMI re-lock,
-  non-exact timing) is delivered **black-padded**, not discarded.  Our
-  parser's CV-23 exact-size gate (`avmcv710-parser.c` `avm_handle_frame_end`)
-  drops any C1 whose word count ≠ the mode target instead.
-  Also: the `frame_words >= 40000` floor (`avmcv710-parser.c:675`) is
-  invented — the value `40000` / `0x9C40` occurs **nowhere** in the vendor
-  binary; it is not the vendor's `MINIMUM_VIDEO_FRAME_WORDS`.
-  Acceptance: a short frame during HDMI re-lock is delivered padded with
-  `0x80108010` (not dropped), matching `PROTOCOL.md` §3 (below the vendor
-  minimum ⇒ drop, otherwise pad to the frame buffer); bounds stay enforced
-  (never over-fill).  RE the vendor's minimum from `ParseAVerData` first.
-- [ ] **FRAMING-LAYER — where does the vendor parse C0/C1?**
-  The literal markers `C0FFFF00` / `C1FFFF00` / `58FFFF00` / `AA5555AA` do
-  **not** occur anywhere in `avmu3_x64.sys`, nor in the macOS
-  `libC875Driver.dylib`.  So the vendor kernel driver either compares them
-  non-literally, or framing is done by the FPGA firmware / user mode, not the
-  kernel driver.  If it is the latter, our in-kernel C0/C1 state machine is a
-  *different layer* and the "parity with the official driver" framing claims
-  must be restated.  Acceptance: a written determination of where the vendor
-  frames the stream, with the xrefs/disassembly that prove it.
+- [x] **PARSER-PAD — short-frame pad-and-keep (vendor) vs drop (ours).**
+  **DONE 2026-10-16** (see the `### 2026-10-16 — PARSER-PAD` entry).  The
+  vendor (`libC877Driver.dylib::Device::initDevice`) pre-fills the 4,608,000-byte
+  (`0x465000` = 1920×1200×2 = `AVM_FRAME_BPF`) frame buffer with `0x80108010`
+  (studio black) and copies the raster over it, so a short frame is delivered
+  black-padded.  Our parser now does the same via `avm_reconcile_frame()`:
+  a C1 inside the locked mode's window is presented at `mode->target` words
+  with an `AVM_PAD_WORD` tail (long frames truncated); counts outside every
+  window are still dropped (CV-23).  The invented `frame_words >= 40000` floor
+  (`40000`/`0x9C40` occurs nowhere in the vendor binaries) is gone.  Pending
+  user hardware test.
+- [x] **FRAMING-LAYER — where does the vendor parse C0/C1?**  **RESOLVED
+  2026-10-16.**  The vendor *does* frame the stream in the driver, but it
+  dispatches on the **marker's leading byte** (`ParseAVerData::determineNextState`
+  compares against `0xC0` / `0xC1` / `0x58` as single bytes), so the 32-bit
+  constants `C0FFFF00`/`C1FFFF00`/`58FFFF00` never appear — that is why the
+  earlier scan came up empty.  Both `libC877Driver.dylib` (readable symbols)
+  and `avmu3_x64.sys` (many `add $0xc0` C0-checksum sites) parse C0/C1 in the
+  kernel driver.  Our in-kernel state machine is the same layer as the vendor;
+  the earlier "marker constants absent" note was a false lead.
 - [ ] **BOOTSTRAP-PARITY — 871-command replay vs `CRXADV7604`/`CLFE3` init.**
   Diff our `avmcv710-bootstrap.h` trace against the vendor's
   `CRXADV7604::HardwareInit` / `ConfigureRx` / `ADIAPI_TvInit` and the

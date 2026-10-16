@@ -62,6 +62,15 @@ struct avm_audio;
 #define AVM_MARKER_AUDIO	0x58FFFF00u	/* audio packet start */
 #define AVM_MARKER_AUDIO_PAD	0xAA5555AAu	/* audio pad / DMA align */
 
+/*
+ * Legal YUY2 "studio black" macropixel (Y=16, U=128, Y=16, V=128).  The
+ * vendor driver pre-fills its frame buffer with this word and lays the
+ * received raster over it, so a frame that lost lines is presented
+ * black-padded rather than dropped.  Used to pad the tail of a short C1
+ * frame (PROTOCOL.md §3, "Active Video Frame Validation and Padding").
+ */
+#define AVM_PAD_WORD		0x80108010u
+
 /* Streaming pipeline.  Latency = (urbs - 1) chunks of pre-buffering: each
  * chunk is 2 MB, so 4 URBs hold ~1 frame of slack at 1080p60 (~33 ms) while
  * still covering USB scheduling jitter.  6+ URBs pre-buffered ~2 frames and
@@ -75,9 +84,11 @@ struct avm_device;
 
 /*
  * Mode descriptor.  1 word = 1 YUY2 macropixel = 2 px.  `target` is the
- * word count a C1 must carry to pass the exact-size gate (CV-23): the
- * standard table entries are fixed, and the adaptive entries adopt the
- * word count of the sample that matched the ADV7604 measurement.
+ * word count a C1 is presented at: the standard table entries are fixed, and
+ * the adaptive entries adopt the word count of the sample that matched the
+ * ADV7604 measurement.  A short frame is black-padded up to `target` and a
+ * long one truncated (avm_reconcile_frame); only counts outside the mode
+ * window are dropped (CV-23).
  */
 struct avm_mode {
 	u32 w, h, target;
@@ -136,10 +147,10 @@ struct avm_parser {
 	u32 frame_sequence;	/* DQBUF sequence counter (V4L2_BUF.sequence) */
 
 	/* scratch mode for the adaptive measurement path (avm_detect_mode):
-	 * populated on every frame examined by the parser worker; the CV-23
-	 * exact-size gate compares against ->target, which the tolerant
-	 * branches set to the observed word count.  Per-device: two adapters
-	 * must not share a static scratch mode. */
+	 * populated on every frame examined by the parser worker; the
+	 * reconcile/present step uses ->target, which the tolerant branches set
+	 * to the observed word count.  Per-device: two adapters must not share
+	 * a static scratch mode. */
 	struct avm_mode meas;
 
 	/* liveness / pacing: last time real frame data was seen (diagnostic
@@ -153,6 +164,7 @@ struct avm_parser {
 	atomic_t valid_frames;
 	atomic_t dropped_frames;
 	atomic_t corrupt_frames;
+	atomic_t padded_frames;	/* short frames delivered black-padded */
 	atomic_t resync_count;
 };
 

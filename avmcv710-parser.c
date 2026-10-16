@@ -10,9 +10,10 @@
  *   - all "remaining space" arithmetic is clamped with min()/>= so a
  *     capacity minus-used can never underflow (the underflow family of
  *     bugs caused the userspace memcpy fault; here it would be a panic)
- *   - frame word counts are gated: a frame whose size does not match the
- *     locked mode geometry is dropped, never padded or presented skewed
- *     (CV-23 rule)
+ *   - frame word counts are reconciled against the locked mode geometry:
+ *     a count outside the mode's window is dropped (CV-23), but a short
+ *     frame inside the window is black-padded with AVM_PAD_WORD and a long
+ *     one truncated, matching the vendor's pre-filled frame buffer
  *   - audio packets are demuxed so the video raster stays aligned and their
  *     payload is handed to the ALSA capture PCM (avmcv710-audio.c); with no
  *     capture client open the bytes are simply dropped
@@ -254,6 +255,7 @@ void avm_parser_reset(struct avm_device *dev)
 	atomic_set(&p->valid_frames, 0);
 	atomic_set(&p->dropped_frames, 0);
 	atomic_set(&p->corrupt_frames, 0);
+	atomic_set(&p->padded_frames, 0);
 	atomic_set(&p->resync_count, 0);
 }
 
@@ -424,8 +426,49 @@ static void avm_weave_field(struct avm_device *dev, u32 field_words)
 }
 
 /*
- * Process one C1 frame end.  Delivers only frames that exactly match the
- * locked mode geometry; everything else is transport damage (CV-23).
+ * Reconcile a completed C1 frame/field of `have` words against the locked
+ * mode's target.  Vendor behavior: the official driver pre-fills its frame
+ * buffer with AVM_PAD_WORD (studio black) and copies the received raster
+ * over it, so a frame that lost lines (HDMI re-lock, transient FPGA
+ * underrun) is delivered black-padded instead of discarded.  The mode
+ * detector has already refused word counts outside the mode's plausible
+ * window, so anything that reaches here is a real frame for this mode.
+ *
+ * Presents exactly want = mode->target words (the geometry consumers were
+ * told to expect): a short frame gets a black tail, an over-long frame is
+ * truncated.  Returns the word count to present, or 0 for an
+ * unrepresentable target.
+ */
+static u32 avm_reconcile_frame(struct avm_device *dev,
+			       const struct avm_mode *mode, u32 have)
+{
+	struct avm_parser *p = &dev->parser;
+	u32 want = mode->target;
+	u32 *dst;
+	u32 k;
+
+	if (!want || want > AVM_MAX_FRAME_WORDS)
+		return 0;
+
+	if (have < want) {
+		dst = (u32 *)p->frame;
+		for (k = have; k < want; k++)
+			dst[k] = AVM_PAD_WORD;
+		atomic_inc(&p->padded_frames);
+		dev_info_ratelimited(&dev->udev->dev,
+			"short frame: %u/%u words, black-padded\n",
+			have, want);
+	}
+	/* have >= want: any tail beyond the target is transport damage. */
+	return want;
+}
+
+/*
+ * Process one C1 frame end.  Frames that land in the locked mode's
+ * word-count window are presented at the mode geometry: short frames (HDMI
+ * re-lock, transient FPGA underrun) are black-padded with AVM_PAD_WORD to
+ * match the vendor, over-long frames are truncated.  Word counts outside
+ * every mode window are transport damage and dropped (CV-23).
  */
 static void avm_handle_frame_end(struct avm_device *dev, u32 frame_words)
 {
@@ -435,6 +478,7 @@ static void avm_handle_frame_end(struct avm_device *dev, u32 frame_words)
 	/* The FPGA's own C0 scan-mode flag (b2 & 0x80) is the authoritative
 	 * interlace source; the status worker's STDI bit is the fallback. */
 	bool interlaced;
+	u32 present;
 
 	if (!frame_words) {
 		atomic_inc(&p->dropped_frames);
@@ -488,25 +532,21 @@ static void avm_handle_frame_end(struct avm_device *dev, u32 frame_words)
 		return;
 	}
 
-	if (mode->interlaced) {
-		/* interlaced word counts are FIELD words (CV-23 exact-size gate) */
-		if (frame_words != mode->target) {
-			atomic_inc(&p->corrupt_frames);
-			atomic_inc(&p->dropped_frames);
-			return;
-		}
-		avm_weave_field(dev, frame_words);
-		return;
-	}
-
-	if (frame_words != mode->target) {
+	/* Interlaced word counts are FIELD words (half the frame height). */
+	present = avm_reconcile_frame(dev, mode, frame_words);
+	if (!present) {
 		atomic_inc(&p->corrupt_frames);
 		atomic_inc(&p->dropped_frames);
 		return;
 	}
 
+	if (mode->interlaced) {
+		avm_weave_field(dev, present);
+		return;
+	}
+
 	avm_note_frame(p);
-	avm_deliver_frame(dev, p->frame, frame_words);
+	avm_deliver_frame(dev, p->frame, present);
 }
 
 void avm_parser_feed(struct avm_device *dev, u32 *d, u32 count)
@@ -671,7 +711,7 @@ void avm_parser_feed(struct avm_device *dev, u32 *d, u32 count)
 				continue;
 			}
 
-			if (trailer_valid && p->in_video && p->frame_words >= 40000) {
+			if (trailer_valid && p->in_video && p->frame_words > 0) {
 				avm_handle_frame_end(dev, p->frame_words);
 			} else if (p->in_video && p->frame_words > 0) {
 				/* lone / bad-trailer C1: end frame, discard it */

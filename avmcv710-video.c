@@ -588,10 +588,11 @@ static void avm_stop_streaming(struct vb2_queue *q)
 	avm_fpga_work_mode(dev, false);
 
 	dev_dbg(&dev->udev->dev,
-		"stop: valid %d dropped %d corrupt %d resync %d\n",
+		"stop: valid %d dropped %d corrupt %d padded %d resync %d\n",
 		atomic_read(&dev->parser.valid_frames),
 		atomic_read(&dev->parser.dropped_frames),
 		atomic_read(&dev->parser.corrupt_frames),
+		atomic_read(&dev->parser.padded_frames),
 		atomic_read(&dev->parser.resync_count));
 }
 

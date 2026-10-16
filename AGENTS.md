@@ -186,8 +186,11 @@ Decision tree (implement based ONLY on the result):
   `guarded >= / min()` clamps — a `words - cur` underflow family of bugs was
   the original userspace crash (CV-23 rules).  Never assume a marker/header is
   fully in the current chunk.
-- Exact-size frame gate: a C1 whose word count does not match the active
-  mode's `target_words` is a corruption — **drop it, never repair**.
+- Frame-size reconciliation: a C1 whose word count lands **outside** the
+  active mode's detection window is corruption — **drop it**.  A count
+  *inside* the window is reconciled to `target_words`: short frames are
+  black-padded with `AVM_PAD_WORD` (`0x80108010`) and long ones truncated
+  (vendor parity, 2026-10-16) — never write past `AVM_MAX_FRAME_WORDS`.
 - Parsing happens ONLY in the workqueue (process context), never in the URB
   completion callback.  The completion just parks chunks on `drain_list`.
 - vb2 buffers are ERROR-returned on every stop path; a *failed*
@@ -218,8 +221,10 @@ Decision tree (implement based ONLY on the result):
 - **Frame path:** FPGA passes the raster through (no scaling — resolution is
   NOT scalable).  Parser locks a mode via word-count (1080p 1036800, 1080i
   518400, 720p 460800, 576p 207360, 576i 103680, 480p 172800, 480i 86400) with
-  4-frame hysteresis, weaves interlaced fields (`p->weave`), stamps
-  timestamp+sequence (driver owns them), and calls `avm_deliver_frame()`.
+  4-frame hysteresis, **black-pads a short frame to the mode geometry**
+  (`AVM_PAD_WORD` = 0x80108010, vendor parity) or truncates a long one, weaves
+  interlaced fields (`p->weave`), stamps timestamp+sequence (driver owns
+  them), and calls `avm_deliver_frame()`.
 - **Status poll (TODO-2):** while streaming, every 3rd ~33 ms tick reads
   IO 0x20/0x6A (TMDS lock `(v&0xE0)==0xE0 && v&0x10`), IO 0x20/0x12 (interlace
   bit 4), HDMI 0x34/0x07+0x09 (12-bit W/H), publishes `dev->sig` under
@@ -286,8 +291,8 @@ Decision tree (implement based ONLY on the result):
 | TODO-2 | ADV7604 status poll | built + committed `482fed3`,`7ebb4b6` — **user test pending** |
 | TODO-3 | No-signal/out-of-range overlays | **removed 2026-10-15** (splash subsystem deleted; DEVLOG parity matrix = regression) |
 | TODO-4 | Soft-reload / probe -110 timeout | probe timeout -110 after wedged EP1; auto-recovery module param `auto_reset` (default 0=off); test pending after replug |
-| PARSER-PAD | Short-frame pad-and-keep (vendor) vs drop (ours); replace invented `40000` floor | open — see DEVLOG `### P0 — vendor-parity gaps` (2026-10-15 RE) |
-| FRAMING-LAYER | Determine where the vendor parses C0/C1 (markers absent from `avmu3_x64.sys` / `libC875Driver.dylib`) | open |
+| PARSER-PAD | Short frames black-padded (`AVM_PAD_WORD` 0x80108010) to the mode geometry; invented `40000` floor removed | done 2026-10-16 — **user test pending** |
+| FRAMING-LAYER | Where the vendor parses C0/C1 | resolved 2026-10-16: in the driver, byte-wise marker dispatch (readable in `libC877Driver.dylib`) |
 | BOOTSTRAP-PARITY | Diff 871-cmd replay vs `CRXADV7604`/`CLFE3` init in the `.sys` | open |
 | — | 2026-10-12 bug-hunt fixes (8 bugs: unload pin, adaptive-mode dead delivery, sequence race, adapter shared scratch mode, URB fail-path leak, status-work pre-init cancel, bootstrap scratch guard, audio hw_free barrier) | fixed + committed; see `### 2026-10-12 (late)` devlog entry |
 | — | 2026-10-13 bug-hunt & completion (DMA bounce buffers, inter-frame audio, alignment, colorspace auto-detection, ALSA 32k/44.1k/48k, EPIPE stall recovery, auto_reset watchdog) | fixed + compiled; see `### 2026-10-13` devlog entry |
@@ -297,8 +302,8 @@ Decision tree (implement based ONLY on the result):
 | — | Suspend/resume safe audio | ✅ SNDRV_PCM_INFO_PAUSE/RESUME, trigger ops, buffer_size ring alignment |
 
 Current module identity (for regression diffing): `srcversion
-DD67527A5AD86CE6D3F925C` (streamlined rewrite, 2026-10-15 — see
-`docs/DEVLOG.md` "### 2026-10-15"), parms `cvx8897`, `avm_audio`
+175B77B95E4CE52C6CF1E38` (PARSER-PAD, 2026-10-16 — see
+`docs/DEVLOG.md` "### 2026-10-16"), parms `cvx8897`, `avm_audio`
 (bool, default off), `avm_audio_index`, `avm_audio_id`, `auto_reset`
 (bool, default off), `softdep: pre: snd-pcm`, 4×2 MB URBs.  `fix-driver.sh`
 

@@ -243,7 +243,8 @@ static bool avm_signal_ok(const struct avm_signal *sig)
 {
 	if (!sig->valid || !sig->tmds_locked)
 		return false;
-	if (sig->w < 320 || sig->w > 4095 || sig->h < 120 || sig->h > 2048)
+	if (sig->w < 320 || sig->w > 4095 || (sig->w & 1) ||
+	    sig->h < 120 || sig->h > 2048)
 		return false;
 	/* frame must fit the staging buffers or it can never be delivered */
 	if ((u64)sig->w * sig->h / 2 > AVM_MAX_FRAME_WORDS)

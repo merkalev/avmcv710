@@ -24,7 +24,7 @@ set -u
 
 MOD="avmcv710"
 DRV="/sys/bus/usb/drivers/$MOD"
-EXPECTED_SRC="274C2F9F7E2F7CED07FEAF9"   # 2026-10-16 pass-2 deep-scan fixes
+EXPECTED_SRC="7DF4E6E314E3990381E9E89"   # 2026-10-16 pass-3 deep-scan fixes
 
 [ "$(id -u)" -eq 0 ] || { echo "run as root (sudo ./fix-driver.sh)"; exit 1; }
 
@@ -42,7 +42,7 @@ if [ -f "$here/avmcv710.ko" ]; then
 	inst_src="$(modinfo "$MOD" 2>/dev/null | awk '/^srcversion/{print $2}')"
 	if [ -n "$built_src" ] && [ "$built_src" != "$inst_src" ]; then
 		echo "installed $MOD is ${inst_src:-none}; tree build is $built_src -> installing it"
-		make -C "$here" KDIR="/lib/modules/$(uname -r)/build" LLVM=1 install >/dev/null \
+		make -C "$here" KDIR="/lib/modules/$(uname -r)/build" install >/dev/null \
 			|| fail "make install failed"
 		depmod "$(uname -r)"
 		echo "installed fresh build ($built_src)"

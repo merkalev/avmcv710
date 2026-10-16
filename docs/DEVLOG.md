@@ -22,15 +22,12 @@ Working and user-confirmed:
 - Frame rate conversion (CVX8897), opt-in via `cvx8897=1`
 - STREAMON no-data watchdog (soft-reload diagnosis)
 - `measured_fps` no longer reports 61 for a 60 Hz source
+- **ALSA capture PCM (TODO-1)** — verified working flawlessly on hardware (2026-10-16):
+  S16LE stereo at 32/44.1/48 kHz, oversize packet ring-handling, TMDS unlock silence gating,
+  and standalone pipeline refcounting (both standalone `arecord` and combined OBS capture).
+- Continuous inter-frame audio demux (packets between C1 and C0).
 
 Built, awaiting user install/test:
-- **ALSA capture PCM (TODO-1), opt-in** — parser pushes the 0x58 audio
-  payload straight into the PCM DMA buffer (snd-usb-audio model), card id
-  `AVMCV710`.  S16LE stereo at the source rate: the status poll reads the
-  Audio InfoFrame and the PCM pins itself to 32000/44100/48000 Hz.
-  **Registration is disabled by default (`avm_audio=0`).**
-- **Continuous inter-frame audio:** audio demux now captures packets arriving
-  between C1 and C0.
 - ADV7604 status poll (TODO-2): 1 Hz while streaming, publishes `dev->sig`
   (TMDS lock / interlace / measured geometry / colorspace / RGB)
 - Standby overlays (TODO-3, **restored 2026-10-16**): the four vendor
@@ -58,7 +55,7 @@ Built, awaiting user install/test:
 | Short/partial frame (re-lock) | kept, black-padded `0x80108010` | kept, black-padded (`AVM_PAD_WORD`) | ✅ (test pending) |
 | Res/fps change without restart | yes | yes (V4L2_EVENT_SOURCE_CHANGE) | ✅ |
 | "Video Input Frame Rate" 60/50/30/25 | CVX8897 | CVX8897, opt-in; menu = {native, native/2} only | ✅ |
-| Audio S16LE stereo @ 32/44.1/48 kHz | yes (PCM) | ALSA capture PCM (`avmcv710-audio.c`), opt-in `avm_audio=1`, sink pinned to the source rate from the Audio InfoFrame; standalone capture supported via refcounted pipeline | ✅ (test pending, opt-in) |
+| Audio S16LE stereo @ 32/44.1/48 kHz | yes (PCM) | ALSA capture PCM (`avmcv710-audio.c`), opt-in `avm_audio=1`, sink pinned to the source rate from the Audio InfoFrame; standalone capture supported via refcounted pipeline | ✅ (hardware verified) |
 | No-signal overlay | yes (BMP splice) | 640x480 BMP (macOS rendition) composited at live geometry, RLE-stored (2026-10-16) | ✅ (test pending) |
 | Out-of-range overlay | yes | receiver-driven **and** non-native S_FMT request (`avm_req_mismatch`), 2026-10-16 | ✅ (test pending) |
 | Content-protection overlay | yes | compiled in (`aver_custom_content_protection.bmp`); trigger not wired (HDCP doc only) | 🟡 doc |
@@ -67,7 +64,7 @@ Built, awaiting user install/test:
 | Clean unload (rmmod without replug) | n/a | unbind drops the ALSA pin in disconnect; rmmod succeeds | ✅ (fixed 2026-10-12) |
 | EDID upload / HPD handshake on start | yes (every open) | yes: 871-cmd trace, 256 B on bridge id 0x36, byte-identical to the vendor binaries' EDID | ✅ |
 | Bootstrap sequence reverse-engineered | yes | 100% of opcodes mapped (Atmel AT88SC CryptoMemory auth, PCA9539, CVX8897 bus 1, ADV7604, EDID, Lattice ECP3); see `docs/BOOTSTRAP.md` & `docs/BOOTSTRAP_I2C.md` | ✅ |
-| Standalone ALSA audio capture | yes | Hardware streaming refcounted across video and audio (`avm_pipeline_start`/`stop`); arecord captures without video running | ✅ (test pending, opt-in) |
+| Standalone ALSA audio capture | yes | Hardware streaming refcounted across video and audio (`avm_pipeline_start`/`stop`); arecord captures without video running | ✅ (hardware verified) |
 | EP1 wedge recovery | drain + stall service | drain + toggle reset + retry + bounce bufs | ✅ |
 
 ---

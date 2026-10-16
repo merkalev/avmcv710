@@ -61,7 +61,8 @@ everything here.
   CVX8897; the advertised interval menu is `{native, native/2}`, because the
   converter can only halve the source rate.
 - **Audio (opt-in).** `avm_audio=1` registers a capture PCM
-  (`hw:CARD=AVMCV710`, S16LE stereo at 32 / 44.1 / 48 kHz).
+  (`hw:CARD=AVMCV710`, S16LE stereo). The sink is pinned to the source's
+  sample rate (32 / 44.1 / 48 kHz), read from the HDMI Audio InfoFrame.
 - **Fast bootstrap.** 871 commands replayed over EP1 from a generated table,
   the same final register state as the full capture but roughly 8x faster.
   `tools/check_bootstrap.py` verifies it (capture parity and the 256-byte
@@ -135,8 +136,8 @@ output mode first.
 | `avmcv710-usb.c` | probe/disconnect, URB pipeline, parse workqueue, teardown, watchdog |
 | `avmcv710-video.c` | V4L2 + vb2 queue, format negotiation, streaming lifecycle |
 | `avmcv710-cvx8897.c` | CVX8897 frame-rate converter (opt-in) |
-| `avmcv710-audio.c` | ALSA capture PCM (opt-in, S16LE stereo 32/44.1/48 kHz) |
-| `avmcv710-status.c` | ADV7604 status poll (1 Hz) and standby overlays |
+| `avmcv710-audio.c` | ALSA capture PCM (opt-in, S16LE stereo at the source rate) |
+| `avmcv710-status.c` | ADV7604 status poll (1 Hz), audio rate, standby overlays |
 | `avmcv710-bootstrap.h` | tracked, pre-parsed 871-command bootstrap table |
 | `avmcv710-bmp.h` | generated (gitignored) RLE standby overlays |
 | `avmcv710-cvx8897.h` | generated (gitignored) CVX8897 register tables |

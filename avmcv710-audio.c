@@ -11,9 +11,11 @@
  *   - marker 0x58FFFF00, then a length word:
  *       audioBytes = ((raw >> 16) & 0xFF) << 8 | ((raw >> 24) & 0xFF)
  *     valid range 512..8192 bytes, 4-byte aligned (payload is word-sized)
- *   - the payload is packed S16LE stereo at the HDMI audio clock; the
- *     userspace driver defaults the sink to 48 kHz and so do we (parsing the
- *     Audio Infoframe for 32/44.1/48 is a TODO-2 follow-up)
+ *   - the payload is packed S16LE stereo at the HDMI audio clock.  The
+ *     source's real rate comes from the Audio InfoFrame (read by the status
+ *     poll and published in avm_signal.audio_rate); the sink advertises
+ *     32/44.1/48 kHz and avm_audio_pcm_open() pins whichever the source
+ *     sends, because the FPGA does not resample
  *   - payload is followed by 0xAA5555AA padding until the next marker
  *
  * Sink model (snd-usb-audio style): the parser worker copies payload bytes
@@ -43,7 +45,9 @@
 /* the PCM device cannot register before the sound core is loaded */
 MODULE_SOFTDEP("pre: snd-pcm");
 
-#define AVM_AUDIO_RATE		48000	/* HDMI audio clock, SDL default */
+/* Fallback rate: the FPGA forwards the HDMI audio clock untouched, so the
+ * sink's real rate is whatever the source sends (see struct avm_signal). */
+#define AVM_AUDIO_RATE		AVM_AUDIO_RATE_DEFAULT
 #define AVM_AUDIO_CHANNELS	2	/* S16LE interleaved stereo */
 #define AVM_AUDIO_RING_BYTES	(1u << 20) /* PCM buffer max: ~5.5 s @ 48k */
 #define AVM_AUDIO_PERIOD_MIN	1920	/* 10 ms @ 48k/2ch/S16LE */
@@ -103,9 +107,35 @@ static const struct snd_pcm_hardware avm_audio_hw = {
 	.fifo_size = 0,
 };
 
+/*
+ * The source's sample rate, when the status poll has seen one the sink can
+ * carry.  0 = not known yet, and the application is then free to pick any
+ * advertised rate (the previous fixed-48 kHz behaviour).
+ */
+static u32 avm_audio_source_rate(struct avm_audio *a)
+{
+	struct avm_device *dev = a->dev;
+	unsigned long flags;
+	u32 rate;
+
+	spin_lock_irqsave(&dev->sig_lock, flags);
+	rate = dev->sig.audio_rate;
+	spin_unlock_irqrestore(&dev->sig_lock, flags);
+
+	switch (rate) {
+	case 32000:
+	case 44100:
+	case 48000:
+		return rate;
+	default:
+		return 0;
+	}
+}
+
 static int avm_audio_pcm_open(struct snd_pcm_substream *subs)
 {
 	struct avm_audio *a = snd_pcm_substream_chip(subs);
+	u32 src_rate;
 	unsigned long flags;
 
 	spin_lock_irqsave(&a->lock, flags);
@@ -117,6 +147,17 @@ static int avm_audio_pcm_open(struct snd_pcm_substream *subs)
 	spin_unlock_irqrestore(&a->lock, flags);
 
 	subs->runtime->hw = avm_audio_hw;
+	/*
+	 * Pin the sink to the source's rate when it is known.  Nothing in the
+	 * path resamples, so an application opening at any other rate would
+	 * play the stream at the wrong pitch (the userspace driver hit the
+	 * same thing and retunes its SDL stream; ISSUES.md section 12).
+	 */
+	src_rate = avm_audio_source_rate(a);
+	if (src_rate)
+		snd_pcm_hw_constraint_single(subs->runtime,
+					     SNDRV_PCM_HW_PARAM_RATE,
+					     src_rate);
 	snd_pcm_hw_constraint_integer(subs->runtime,
 				      SNDRV_PCM_HW_PARAM_PERIODS);
 	/* payload and period sizes stay frame-aligned (4 B S16LE stereo) */
@@ -395,8 +436,7 @@ int avm_audio_init(struct avm_device *dev)
 
 	WRITE_ONCE(dev->audio, a);
 	dev_info(&dev->udev->dev,
-		 "ALSA capture PCM registered (S16LE stereo %u Hz)\n",
-		 AVM_AUDIO_RATE);
+		 "ALSA capture PCM registered (S16LE stereo, source-paced 32/44.1/48 kHz)\n");
 	return 0;
 
 err_card:

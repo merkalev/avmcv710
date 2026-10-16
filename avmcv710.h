@@ -71,6 +71,14 @@ struct avm_audio;
  */
 #define AVM_PAD_WORD		0x80108010u
 
+/*
+ * HDMI audio sample rate assumed when the Audio InfoFrame is absent or
+ * unreadable (Hz).  The capture PCM advertises 32/44.1/48 kHz; the source's
+ * real rate is read from the Audio InfoFrame by the status poll and published
+ * in struct avm_signal.
+ */
+#define AVM_AUDIO_RATE_DEFAULT	48000u
+
 /* Streaming pipeline.  Latency = (urbs - 1) chunks of pre-buffering: each
  * chunk is 2 MB, so 4 URBs hold ~1 frame of slack at 1080p60 (~33 ms) while
  * still covering USB scheduling jitter.  6+ URBs pre-buffered ~2 frames and
@@ -175,6 +183,8 @@ struct avm_signal {
 	bool interlaced;	/* IO 0x12 STDI bit 4 */
 	bool rgb;		/* HDMI 0x53: <= 0x01 is RGB (vs YCbCr) */
 	u8 colorspace;		/* raw HDMI 0x53 low nibble */
+	bool audio_locked;	/* HDMI 0x04 bit0 (PLL) && 0x18 bit0 (packets) */
+	u32 audio_rate;		/* audio sample rate (Hz) from the Audio InfoFrame */
 	u32 w, h;		/* measured active geometry (12-bit, 0 = n/a) */
 	u32 poll_failures;	/* consecutive failed polls */
 };

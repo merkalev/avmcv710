@@ -26,8 +26,9 @@ Working and user-confirmed:
 Built, awaiting user install/test:
 - **ALSA capture PCM (TODO-1), opt-in** — parser pushes the 0x58 audio
   payload straight into the PCM DMA buffer (snd-usb-audio model), card id
-  `AVMCV710`.  Rates: 32000, 44100, 48000 Hz S16LE stereo. **Registration is
-  disabled by default (`avm_audio=0`).**
+  `AVMCV710`.  S16LE stereo at the source rate: the status poll reads the
+  Audio InfoFrame and the PCM pins itself to 32000/44100/48000 Hz.
+  **Registration is disabled by default (`avm_audio=0`).**
 - **Continuous inter-frame audio:** audio demux now captures packets arriving
   between C1 and C0.
 - ADV7604 status poll (TODO-2): 1 Hz while streaming, publishes `dev->sig`
@@ -57,7 +58,7 @@ Built, awaiting user install/test:
 | Short/partial frame (re-lock) | kept, black-padded `0x80108010` | kept, black-padded (`AVM_PAD_WORD`) | ✅ (test pending) |
 | Res/fps change without restart | yes | yes (V4L2_EVENT_SOURCE_CHANGE) | ✅ |
 | "Video Input Frame Rate" 60/50/30/25 | CVX8897 | CVX8897, opt-in; menu = {native, native/2} only | ✅ |
-| Audio S16LE stereo @ 32/44.1/48 kHz | yes (PCM) | ALSA capture PCM (`avmcv710-audio.c`), opt-in `avm_audio=1` | ✅ (test pending, opt-in) |
+| Audio S16LE stereo @ 32/44.1/48 kHz | yes (PCM) | ALSA capture PCM (`avmcv710-audio.c`), opt-in `avm_audio=1`, sink pinned to the source rate from the Audio InfoFrame | ✅ (test pending, opt-in) |
 | No-signal overlay | yes (BMP splice) | 640x480 BMP (macOS rendition) composited at live geometry, RLE-stored (2026-10-16) | ✅ (test pending) |
 | Out-of-range overlay | yes | receiver-driven **and** non-native S_FMT request (`avm_req_mismatch`), 2026-10-16 | ✅ (test pending) |
 | Content-protection overlay | yes | compiled in (`aver_custom_content_protection.bmp`); trigger not wired (HDCP doc only) | 🟡 doc |
@@ -524,6 +525,52 @@ re-lock) OBS shows a black-padded frame instead of a frozen one; `journalctl -k`
 shows at most a ratelimited `short frame: … black-padded`.  No regression on a
 clean 1080p60 source: every frame is exact, `padded_frames` stays 0.
 
+### 2026-10-16 — audio: source-paced sample rate from the Audio InfoFrame
+
+**Gap.**  The capture PCM was hard-wired to 48 kHz.  The FPGA forwards the HDMI
+audio clock untouched and nothing in the path resamples, so a 44.1 kHz source
+played ~8.8 % fast (audible pitch shift).  The userspace port already reads the
+source rate and retunes its SDL stream (`SdlAudioOutput::setAudioSampleRate`);
+the kernel had no equivalent.
+
+**Spec.**  From `UsbStream::queryVideoSignalStatus` (cv710userspace) plus
+CEA-861:
+
+- Audio InfoFrame *present* flag: IO map 0x60 (bridge 0x20) bit 1.
+- Audio PLL locked: HDMI map 0x04 bit 0; "audio sample packet detected":
+  HDMI 0x18 bit 0.  Both must be set.  HDMI 0x18's low nibble is **not** a
+  rate; decoding one from it latched random values and detuned playback
+  (`cv710userspace/ISSUES.md` §12).
+- The Audio InfoFrame itself lives on the **INFOFRAME page** (I2C slave 0x3e):
+  header at 0xE3 (type 0x84, version 0x01, length 0x0A) and payload byte 1 at
+  0x1D, sample-frequency code in bits 6:2 (1..7 =
+  32k/44.1k/48k/88.2k/96k/176.4k/192k; 0 = refer to the stream header).  Same
+  layout as Linux `hdmi_audio_infoframe_unpack`.
+
+**Change** (`avmcv710-status.c`, `avmcv710.h`, `avmcv710-audio.c`):
+
+- The 1 Hz status tick now also reads audio lock/detect and the InfoFrame and
+  publishes `struct avm_signal.audio_rate` / `audio_locked`.  Every one of
+  those reads is optional: a failure degrades to "audio unknown" and never
+  fails the geometry poll (CV-13).  The rate is sanitised against the last
+  known-good value, defaulting to 48000.
+- A locked-and-detected stream logs
+  `[ADV7604] HDMI audio <rate> Hz (0x04=.., 0x18=.., AIF=..)` on each
+  lock/rate change.
+- `avm_audio_pcm_open()` pins the sink to the source rate with
+  `snd_pcm_hw_constraint_single` once the poll has seen one, so an application
+  cannot open at the wrong pitch; before the first poll the full 32/44.1/48 set
+  stays available (the previous behaviour).
+
+**Divergence kept.**  Infoframe codes above 48 kHz (88.2k..192k) are reported
+but not adopted: the sink advertises up to 48 kHz and the audio packet window
+caps at 8192 bytes.  A `dev_warn_once` names the source rate.
+
+**Acceptance (user test).**  With `avm_audio=1` and a 44.1 kHz HDMI source,
+`arecord -D hw:CARD=AVMCV710 -f S16_LE -c 2 -d 10 /tmp/a.wav` records at
+44100 Hz (journal logs 44100); a 48 kHz source keeps recording at 48 kHz,
+unpitched.
+
 ### 2026-10-15 — streamlined rewrite: bloat elimination, disconnect park fix, clean 1Hz telemetry
 
 Session: clean-slate redesign based on lessons from `cv710userspace` and hardware analysis.
@@ -697,10 +744,9 @@ tuning) — **not FX3/EP1 commands**.  Nothing to port to the kernel.
   the known-stable video-only module.  Acceptance: with `avm_audio=1`,
   `arecord -D hw:CARD=AVMCV710 -f S16_LE -r 48000 -c 2 -d 10 /tmp/a.wav`
   while OBS records (`/proc/asound/cards` lists AVMCV710), **and** the rest of
-  the system keeps producing sound (no WirePlumber collapse).  Open
-  follow-up: sample rate is fixed 48 kHz; parse the Audio Infoframe
-  (0x34/0x18 bit 0 + infoframe byte 1 bits 4:2) to honour 32/44.1 kHz
-  sources.
+  the system keeps producing sound (no WirePlumber collapse).  Source rate
+  is now read from the Audio InfoFrame (2026-10-16): the sink pins itself to
+  the incoming 32/44.1/48 kHz instead of always playing at 48 kHz.
 - [ ] **TODO-4 soft-reload no output & probe -110 timeout** —
   Observed log (2026-10-13 23:08):
   ```text
@@ -807,7 +853,8 @@ ship; C877 is the CV710.)
   gets the vendor's dedicated RGB table instead of the YCbCr 4:2:2 table
   (interlace + input rate + colorspace are now polled/measured).
 - [x] Audio: expanded ALSA capture PCM constraints to support 32/44.1/48 kHz
-  sample rates.
+  sample rates, and the status poll now reads the source's real rate from the
+  Audio InfoFrame (2026-10-16) so the sink is pinned to it instead of 48 kHz.
 - [x] Watchdog auto-recovery: `auto_reset` module parameter (default 0=off)
   triggers `usb_reset_device(dev->udev)` when silent stream is flagged.
 

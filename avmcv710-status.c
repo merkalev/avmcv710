@@ -100,13 +100,79 @@ static void avm_splash_expand(struct avm_device *dev, enum avm_splash kind)
 	dev->splash_cached = kind;
 }
 
+/* Last published audio rate, sanitised to something the sink can carry. */
+static u32 avm_last_audio_rate(struct avm_device *dev)
+{
+	unsigned long flags;
+	u32 rate;
+
+	spin_lock_irqsave(&dev->sig_lock, flags);
+	rate = dev->sig.audio_rate;
+	spin_unlock_irqrestore(&dev->sig_lock, flags);
+
+	switch (rate) {
+	case 32000:
+	case 44100:
+	case 48000:
+		return rate;
+	default:
+		return AVM_AUDIO_RATE_DEFAULT;
+	}
+}
+
+/*
+ * HDMI audio sample rate, read from the received Audio InfoFrame on the
+ * INFOFRAME page (slave 0x3e).  Never from HDMI 0x18: its low nibble is not a
+ * rate (bit 0 is only "audio sample packet detected"), and decoding it as one
+ * latched random 32/44.1/48 values and detuned playback (cv710userspace
+ * ISSUES.md section 12).
+ *
+ * Layout per CEA-861 / Linux hdmi_audio_infoframe_unpack: the InfoFrame
+ * header sits at 0xE3 (type 0x84 = Audio, version 1, length 0x0A) and payload
+ * byte 1 at 0x1D carries the sample-frequency code in bits 6:2 (1..7 = 32k,
+ * 44.1k, 48k, 88.2k, 96k, 176.4k, 192k; 0 = refer to the stream header).
+ * The FPGA forwards the HDMI audio clock untouched and the capture PCM
+ * advertises up to 48 kHz, so a faster infoframe is reported but not adopted.
+ * Any failure keeps the last known-good rate.
+ */
+static u32 avm_poll_audio_rate(struct avm_device *dev, bool ready, u8 presence)
+{
+	static const u32 aif_rate[8] = {
+		0, 32000, 44100, 48000, 88200, 96000, 176400, 192000
+	};
+	u8 head[3], pb[2];
+	u32 rate = avm_last_audio_rate(dev);
+	u32 hz;
+
+	/* the InfoFrame-present flag is IO 0x60 bit 1 */
+	if (!ready || !(presence & 0x02))
+		return rate;
+	if (avm_i2c_read_block(dev, 0x3e, 0xE3, head, 3) ||
+	    head[0] != 0x84 || head[1] != 0x01 || head[2] != 0x0A)
+		return rate;
+	if (avm_i2c_read_block(dev, 0x3e, 0x1C, pb, 2))
+		return rate;
+
+	hz = aif_rate[(pb[1] >> 2) & 0x07];
+	if (!hz)
+		return rate;		/* 0 = refer to the stream header */
+	if (hz > 48000) {
+		dev_warn_once(&dev->udev->dev,
+			      "HDMI audio source is %u Hz; the capture PCM advertises up to 48 kHz\n",
+			      hz);
+		return AVM_AUDIO_RATE_DEFAULT;
+	}
+	return hz;
+}
+
 static void avm_poll_signal(struct avm_device *dev)
 {
 	struct avm_signal sig;
 	u8 io_lock = 0, io_flags = 0;
 	u8 wb[2] = { 0, 0 }, hb[2] = { 0, 0 };
-	u8 cs = 0;
-	bool lock_change, prev_locked;
+	u8 cs = 0, aud_pll = 0, aud_pkt = 0, io_presence = 0;
+	bool lock_change, prev_locked, rate_change;
+	u32 prev_rate;
 	unsigned long flags;
 
 	/*
@@ -128,6 +194,17 @@ static void avm_poll_signal(struct avm_device *dev)
 	if (avm_i2c_read_block(dev, 0x34, 0x53, &cs, 1))
 		cs = 0;
 
+	/*
+	 * HDMI audio: PLL lock is 0x04 bit 0 and "audio sample packet
+	 * detected" is 0x18 bit 0 (per Linux adv7604.c), so a locked and
+	 * detected stream needs both.  Optional reads: a failure degrades to
+	 * "audio unknown" instead of failing the geometry poll.
+	 */
+	if (avm_i2c_read_block(dev, 0x34, 0x04, &aud_pll, 1) ||
+	    avm_i2c_read_block(dev, 0x34, 0x18, &aud_pkt, 1) ||
+	    avm_i2c_read_block(dev, 0x20, 0x60, &io_presence, 1))
+		aud_pll = aud_pkt = io_presence = 0;
+
 	sig.valid = true;
 	sig.tmds_locked = ((io_lock & 0xE0) == 0xE0) && (io_lock & 0x10);
 	sig.interlaced = (io_flags & 0x10) != 0;
@@ -135,11 +212,15 @@ static void avm_poll_signal(struct avm_device *dev)
 	sig.h = ((u32)(hb[0] & 0x0F) << 8) | hb[1];
 	sig.colorspace = cs & 0x0F;
 	sig.rgb = (sig.colorspace <= 0x01);
+	sig.audio_locked = (aud_pll & 0x01) && (aud_pkt & 0x01);
+	sig.audio_rate = avm_poll_audio_rate(dev, sig.audio_locked, io_presence);
 	sig.poll_failures = 0;
 
 	spin_lock_irqsave(&dev->sig_lock, flags);
 	prev_locked = dev->sig.tmds_locked;
+	prev_rate = dev->sig.audio_rate;
 	lock_change = !dev->sig.valid || (dev->sig.tmds_locked != sig.tmds_locked);
+	rate_change = prev_rate != sig.audio_rate;
 	dev->sig = sig;
 	spin_unlock_irqrestore(&dev->sig_lock, flags);
 
@@ -150,6 +231,12 @@ static void avm_poll_signal(struct avm_device *dev)
 			 io_lock, io_flags, sig.w, sig.h,
 			 sig.interlaced ? "i" : "p", sig.colorspace);
 	}
+
+	if (sig.tmds_locked && sig.audio_locked && (lock_change || rate_change))
+		dev_info(&dev->udev->dev,
+			 "[ADV7604] HDMI audio %u Hz (0x04=0x%02x, 0x18=0x%02x, AIF=%u)\n",
+			 sig.audio_rate, aud_pll, aud_pkt,
+			 !!(io_presence & 0x02));
 }
 
 /* Does the measured geometry produce stageable, deliverable frames? */

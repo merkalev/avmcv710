@@ -24,7 +24,7 @@ set -u
 
 MOD="avmcv710"
 DRV="/sys/bus/usb/drivers/$MOD"
-EXPECTED_SRC="27DFE0F25007224D8224D56"   # 2026-10-16 overlays: scaled composite (macOS artwork)
+EXPECTED_SRC="5CFFCBFB67D12FA0BD04328"   # 2026-10-16 audio: source-paced rate from the Audio InfoFrame
 
 [ "$(id -u)" -eq 0 ] || { echo "run as root (sudo ./fix-driver.sh)"; exit 1; }
 

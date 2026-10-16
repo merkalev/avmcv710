@@ -251,12 +251,14 @@ Decision tree (implement based ONLY on the result):
 - **Audio (TODO-1), opt-in `avm_audio=1`:** snd-usb-audio push model — parser
   copies 0x58 payload into the PCM DMA buffer, `pointer()` reports the write
   cursor, PCM flagged non-atomic, `snd_pcm_period_elapsed` fired from the
-  parser worker.  Fixed S16LE stereo 48 kHz.  **Registration is off by
+  parser worker.  S16LE stereo; the sink follows the source's rate, read from
+  the Audio InfoFrame by the status poll (32/44.1/48 kHz), instead of a fixed
+  48 kHz.  **Registration is off by
   default** (the card's missing `ops->prepare` oopsed this kernel — it calls
   prepare unconditionally — and collapsed the user's audio stack on first
   install; now provided).  The core maps the vmalloc PCM buffer itself, so
-  no `.mmap`/`.page` ops and no vmalloc-helper imports.  Audio Infoframe
-  rate parse is an open follow-up.
+  no `.mmap`/`.page` ops and no vmalloc-helper imports.  The source rate comes
+  from the Audio InfoFrame (INFOFRAME page, slave 0x3e; 2026-10-16).
 - **Converter (CVX8897):** opt-in `cvx8897=1`.  `avm_cvx8897_half_rate()` maps
   (w,h,fps) to a table; 1080p→60:30/50:25, 720p→same, other geometries
   60→30 only; canned for interlaced.  Programs I2C 7-bit 0x18 + PCA9539
@@ -312,13 +314,14 @@ Decision tree (implement based ONLY on the result):
 | — | 2026-10-12 bug-hunt fixes (8 bugs: unload pin, adaptive-mode dead delivery, sequence race, adapter shared scratch mode, URB fail-path leak, status-work pre-init cancel, bootstrap scratch guard, audio hw_free barrier) | fixed + committed; see `### 2026-10-12 (late)` devlog entry |
 | — | 2026-10-13 bug-hunt & completion (DMA bounce buffers, inter-frame audio, alignment, colorspace auto-detection, ALSA 32k/44.1k/48k, EPIPE stall recovery, auto_reset watchdog) | fixed + compiled; see `### 2026-10-13` devlog entry |
 | — | Converter RGB-vs-422 (AVI colorspace flag) | ✅ auto-detected via HDMI 0x34 reg 0x53 (720p60 RGB table selected) |
-| — | Audio sample rates (32/44.1/48 kHz) | ✅ ALSA PCM constraints and hw_params expanded |
+| — | Audio sample rates (32/44.1/48 kHz) | ✅ ALSA PCM constraints and hw_params expanded; sink pinned to the source rate from the Audio InfoFrame (2026-10-16) |
 | — | HDCP (implementation / interrogation / gating) | won't do (policy, docs only) — see README *Legal* |
 | — | Suspend/resume safe audio | ✅ SNDRV_PCM_INFO_PAUSE/RESUME, trigger ops, buffer_size ring alignment |
 
 Current module identity (for regression diffing): `srcversion
-27DFE0F25007224D8224D56` (overlays scaled to the frame, macOS artwork,
-2026-10-16 — see `docs/DEVLOG.md` "### 2026-10-16"), parms `cvx8897`,
+5CFFCBFB67D12FA0BD04328` (overlays scaled to the frame on the macOS artwork,
+plus the source-paced audio rate, 2026-10-16 — see `docs/DEVLOG.md`
+"### 2026-10-16"), parms `cvx8897`,
 `avm_audio`
 (bool, default off), `avm_audio_index`, `avm_audio_id`, `auto_reset`
 (bool, default off), `softdep: pre: snd-pcm`, 4×2 MB URBs.  `fix-driver.sh`

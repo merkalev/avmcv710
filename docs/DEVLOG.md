@@ -272,6 +272,34 @@ and — when the old build's invisible stray ref survives — prints the
 deliberate `sudo rmmod -f avmcv710 && sudo modprobe avmcv710` escape hatch
 instead of failing silently.
 
+### 2026-10-16: documentation, READMEs renovated, legal posture recorded
+
+Not a driver change.  Both READMEs were rewritten, and the HDCP ticket was
+closed as a policy decision.
+
+**READMEs.**  `avmcv710/README.md` had drifted from HEAD: it still described
+the userspace CV-23 "exact size or drop" gate (PARSER-PAD replaced that),
+advertised the vendor's 60/50/30/25/24/15 frame-interval menu (FPS-MENU cut it
+to `{native, native/2}`), and called audio on-by-default 48 kHz (it is opt-in
+and 32/44.1/48 kHz).  Missing entirely: the restored overlays, the non-native
+out-of-range path and the 1 Hz receiver poll.  The licence note also called
+`cv710userspace` GPL; it is MIT.  Both READMEs now lead with a
+not-affiliated-with-AVerMedia notice, carry a contents list, and drop the old
+bloat; the kernel one gained a module-parameter table, and the userspace
+README's `--convert` wall of prose became a short CVX8897 section.
+
+**Legal posture**, stated in both READMEs: no AVerMedia affiliation;
+reverse-engineered for interoperability, no vendor source; no HDCP (no
+authentication, no key material, no cipher, no key derivation) and no
+circumvention; compliance with capture/recording law is the user's; the
+overlay bitmaps are AVerMedia artwork; no warranty.
+
+**HDCP ticket closed.**  The P2 "keep documentation-only, but log the ADV7604
+HDCP state read" is now won't-do: reading the HDCP map is exactly the
+interrogation the project declines (see the README *Legal* section and
+`cv710userspace/ISSUES.md` section 6).  The `AVM_SPLASH_HDCP` /
+content-protection bitmaps stay compiled in but unreachable.
+
 ### 2026-10-16 — overlay presentation: scale to the frame, macOS artwork
 
 Two corrections to the restored overlays, both from user feedback ("had to

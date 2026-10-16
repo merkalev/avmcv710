@@ -336,5 +336,9 @@ old build's stray ref survives unbind.
   format, bounce/bootstrap ordering — all in the devlog).
 - DON'T add EDID patching / VID_STD auto-switch / scaler emulation (all
   documented divergences).
+- DON'T add HDCP handling of any kind (implementation, interrogation or
+  gating).  Policy, not a gap: see the README *Legal* section and
+  `cv710userspace/ISSUES.md` section 6.  The HDCP / content-protection
+  bitmaps stay unreachable.
 - DON'T make the driver re-probe-in-probe (probe recursion) to "fix"
   TODO-4.

@@ -54,7 +54,7 @@ Built, awaiting user install/test:
 | Geometry resets passthrough | yes (Scaler off by default) | yes (never scales) | ✅ |
 | Short/partial frame (re-lock) | kept, black-padded `0x80108010` | kept, black-padded (`AVM_PAD_WORD`) | ✅ (test pending) |
 | Res/fps change without restart | yes | yes (V4L2_EVENT_SOURCE_CHANGE) | ✅ |
-| "Video Input Frame Rate" 60/50/30/25 | CVX8897 | CVX8897, opt-in (RGB+YCbCr tables) | ✅ |
+| "Video Input Frame Rate" 60/50/30/25 | CVX8897 | CVX8897, opt-in; menu = {native, native/2} only | ✅ |
 | Audio S16LE stereo @ 32/44.1/48 kHz | yes (PCM) | ALSA capture PCM (`avmcv710-audio.c`), opt-in `avm_audio=1` | ✅ (test pending, opt-in) |
 | No-signal overlay | yes (BMP splice) | **removed 2026-10-15** (was: 640×480 BMP composited at live geometry) | ❌ regression |
 | Out-of-range overlay | yes | **removed 2026-10-15** | ❌ regression |
@@ -269,6 +269,36 @@ vdev release), prints `/sys/module/avmcv710/refcnt` while retrying rmmod,
 and — when the old build's invisible stray ref survives — prints the
 deliberate `sudo rmmod -f avmcv710 && sudo modprobe avmcv710` escape hatch
 instead of failing silently.
+
+### 2026-10-16 — frame-interval menu now matches what the hardware can do
+
+Observed behavior: changing the frame rate (or resolution) in OBS "does
+nothing".  Root cause for the rate half: `avm_enum_frameintervals()` advertised
+a fixed 7-entry menu (60/59.94/50/30/29.97/25/24) **regardless of state**, but
+the only rates this device can actually deliver are the source's native rate
+and - with the CVX8897 converter enabled (`cvx8897=1`) - its **half**.  So
+OBS offered 24 / 59.94 / 29.97, and `S_PARM` silently turned them into
+passthrough.  (The resolution half is the vendor overlay behaviour; see the
+`out_of_range` note below.)
+
+Change (`avmcv710-video.c`):
+- `avm_native_fps()`: the input cadence = `measured_fps`, doubled when the
+  converter is currently halving (measured is the delivered rate).
+- `enum_frameintervals()` now offers exactly index 0 = native, and index 1 =
+  native/2 **only when `avm_cvx8897_enabled()`** and the native rate is even.
+  This is the vendor's discrete "Video Input Frame Rate" 60p/30p/50p/25p set,
+  not a fictional 7-way menu.
+- `g_parm` still reports the delivered rate; `s_parm` is unchanged (records
+  the request for the converter worker).
+
+Verified against the vendor control surface: the CVX8897 tables
+(`avm_cvx8897_half_rate`) only ever halve, so any other advertised rate was a
+lie.  `measured_fps`-based, so before a first measurement the menu shows
+{60[, 30]} (the driver's 1080p60 nominal).
+
+Acceptance (user test): with `cvx8897=0` OBS offers only the source rate; with
+`cvx8897=1` it offers the source rate and its half, and picking the half makes
+`journalctl -k` show `cvx8897: halving ...`.
 
 ### 2026-10-16 — PARSER-PAD: short frames black-padded, not dropped (vendor parity)
 

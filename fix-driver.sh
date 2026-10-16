@@ -24,7 +24,7 @@ set -u
 
 MOD="avmcv710"
 DRV="/sys/bus/usb/drivers/$MOD"
-EXPECTED_SRC="175B77B95E4CE52C6CF1E38"   # 2026-10-16 PARSER-PAD (short frames black-padded)
+EXPECTED_SRC="84EB62847AE08B54A924A70"   # 2026-10-16 honest FPS menu (native + half)
 
 [ "$(id -u)" -eq 0 ] || { echo "run as root (sudo ./fix-driver.sh)"; exit 1; }
 

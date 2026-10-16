@@ -292,6 +292,8 @@ Decision tree (implement based ONLY on the result):
 | TODO-3 | No-signal/out-of-range overlays | **removed 2026-10-15** (splash subsystem deleted; DEVLOG parity matrix = regression) |
 | TODO-4 | Soft-reload / probe -110 timeout | probe timeout -110 after wedged EP1; auto-recovery module param `auto_reset` (default 0=off); test pending after replug |
 | PARSER-PAD | Short frames black-padded (`AVM_PAD_WORD` 0x80108010) to the mode geometry; invented `40000` floor removed | done 2026-10-16 — **user test pending** |
+| FPS-MENU | Frame-interval menu now = {native, native/2} (half only with `cvx8897=1`) | done 2026-10-16 — **user test pending** |
+| RES-OVERLAY | Non-native resolution: vendor paints `aver_custom_out_of_range.bmp`; we silently ignore | open (overlay subsystem removed 2026-10-15) |
 | FRAMING-LAYER | Where the vendor parses C0/C1 | resolved 2026-10-16: in the driver, byte-wise marker dispatch (readable in `libC877Driver.dylib`) |
 | BOOTSTRAP-PARITY | Diff 871-cmd replay vs `CRXADV7604`/`CLFE3` init in the `.sys` | open |
 | — | 2026-10-12 bug-hunt fixes (8 bugs: unload pin, adaptive-mode dead delivery, sequence race, adapter shared scratch mode, URB fail-path leak, status-work pre-init cancel, bootstrap scratch guard, audio hw_free barrier) | fixed + committed; see `### 2026-10-12 (late)` devlog entry |
@@ -302,7 +304,7 @@ Decision tree (implement based ONLY on the result):
 | — | Suspend/resume safe audio | ✅ SNDRV_PCM_INFO_PAUSE/RESUME, trigger ops, buffer_size ring alignment |
 
 Current module identity (for regression diffing): `srcversion
-175B77B95E4CE52C6CF1E38` (PARSER-PAD, 2026-10-16 — see
+84EB62847AE08B54A924A70` (honest FPS menu, 2026-10-16 — see
 `docs/DEVLOG.md` "### 2026-10-16"), parms `cvx8897`, `avm_audio`
 (bool, default off), `avm_audio_index`, `avm_audio_id`, `auto_reset`
 (bool, default off), `softdep: pre: snd-pcm`, 4×2 MB URBs.  `fix-driver.sh`

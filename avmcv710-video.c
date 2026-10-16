@@ -34,10 +34,10 @@ static inline struct avm_buffer *to_avm_buffer(struct vb2_buffer *vb)
  *
  * The frame rate is different: the CVX8897 between the receiver and the
  * capture path can halve it in hardware (the vendor's [60p]/[30p]/[50p]/[25p]
- * "Video Input Frame Rate" selector).  When that converter is enabled
- * (avmcv710-cvx8897.c), enum_frameintervals() offers its real menu and S_PARM
- * selects the matching half-rate table; otherwise the source paces the
- * cadence and only the measured interval is honest.
+ * "Video Input Frame Rate" selector).  enum_frameintervals() therefore offers
+ * only {native, native/2} - and the half only when that converter is enabled
+ * (avmcv710-cvx8897.c), which S_PARM then programs; otherwise the source paces
+ * the cadence and only the measured rate is honest.
  */
 
 /* ------------------------------------------------------------------ */
@@ -260,41 +260,70 @@ static int avm_enum_framesizes(struct file *file, void *fh,
 	return -EINVAL;
 }
 
-/* Measured frame rate once the stream is locked, else default nominal 60. */
+/*
+ * Native source cadence.  measured_fps is the *delivered* rate, so while the
+ * CVX8897 is halving, the input rate is twice that.  Before the parser locks
+ * (or before a first measurement) assume the 1080p60 nominal used elsewhere.
+ */
+static u32 avm_native_fps(struct avm_device *dev)
+{
+	u32 fps = READ_ONCE(dev->parser.measured_fps);
+
+	if (!fps || fps > 240)
+		return 60;	/* default nominal rate: 60 fps (1080p60) */
+	if (READ_ONCE(dev->cvx_prog_half))
+		fps *= 2;	/* measured is the half rate; recover the input */
+	return fps;
+}
+
+/* Measured delivered frame rate once the stream is locked, else nominal 60. */
 static void avm_current_interval(struct avm_device *dev,
 				 struct v4l2_fract *tpf)
 {
 	u32 fps = READ_ONCE(dev->parser.measured_fps);
 
 	if (!fps || fps > 240)
-		fps = 60;	/* Default nominal rate: 60 fps (1080p60) */
+		fps = 60;	/* default nominal rate: 60 fps (1080p60) */
 	tpf->numerator = 1;
 	tpf->denominator = fps;
 }
 
-/* Standard capture rates supported by hardware/OBS */
-static const struct v4l2_fract avm_intervals[] = {
-	{ 1, 60 },	/* 60.00 fps */
-	{ 1001, 60000 },/* 59.94 fps */
-	{ 1, 50 },	/* 50.00 fps */
-	{ 1, 30 },	/* 30.00 fps */
-	{ 1001, 30000 },/* 29.97 fps */
-	{ 1, 25 },	/* 25.00 fps */
-	{ 1, 24 },	/* 24.00 fps */
-};
-
+/*
+ * Frame-interval menu.  The source paces the cadence and the FPGA cannot
+ * synthesise new rates; the only rates this device can actually deliver are
+ * the measured native rate and - when the CVX8897 converter is enabled - its
+ * half.  That is the vendor's discrete "Video Input Frame Rate" choice
+ * (60p/30p/50p/25p, avmcv710-cvx8897.c).  The old fixed 7-entry menu was
+ * dishonest: S_PARM can only halve, so 24 / 59.94 / 29.97 silently did
+ * nothing and OBS offered rates the hardware can never produce.
+ */
 static int avm_enum_frameintervals(struct file *file, void *fh,
 				   struct v4l2_frmivalenum *fiv)
 {
+	struct avm_device *dev = video_drvdata(file);
+	u32 fps;
+
 	if (fiv->pixel_format != V4L2_PIX_FMT_YUYV)
 		return -EINVAL;
 
-	if (fiv->index >= ARRAY_SIZE(avm_intervals))
-		return -EINVAL;
+	fps = avm_native_fps(dev);
 
 	fiv->type = V4L2_FRMIVAL_TYPE_DISCRETE;
-	fiv->discrete = avm_intervals[fiv->index];
-	return 0;
+	fiv->discrete.numerator = 1;
+
+	switch (fiv->index) {
+	case 0:
+		fiv->discrete.denominator = fps;
+		return 0;
+	case 1:
+		/* the half rate is real only with the hardware converter on */
+		if (!avm_cvx8897_enabled() || (fps % 2))
+			return -EINVAL;
+		fiv->discrete.denominator = fps / 2;
+		return 0;
+	default:
+		return -EINVAL;
+	}
 }
 
 static int avm_g_parm(struct file *file, void *fh, struct v4l2_streamparm *p)

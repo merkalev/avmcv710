@@ -260,12 +260,14 @@ Decision tree (implement based ONLY on the result):
   no `.mmap`/`.page` ops and no vmalloc-helper imports.  The source rate comes
   from the Audio InfoFrame (INFOFRAME page, slave 0x3e; 2026-10-16).
 - **Converter (CVX8897):** opt-in `cvx8897=1`.  `avm_cvx8897_half_rate()` maps
-  (w,h,fps) to a table; 1080p→60:30/50:25, 720p→same, other geometries
-  60→30 only; canned for interlaced.  Programs I2C 7-bit 0x18 + PCA9539
-  (0x74) reset pulse, sleeps ~3 s on its own workqueue.  RGB-vs-422 is
-  assumed 422 (open follow-up: read AVI colorspace flag).
+  (w,h,fps,rgb) to a table; 1080p→60:30/50:25, 720p→same (including dedicated
+  720p60 RGB table via HDMI 0x34 reg 0x53), other geometries 60→30 only;
+  canned for interlaced.  Programs I2C 7-bit 0x18 + PCA9539 (0x74) reset
+  pulse, sleeps ~3 s on its own workqueue (`cancel_work_sync` in both
+  `stop_streaming` and `disconnect`).
 - **Watchdog:** 5 s delayed work flags STREAMON-with-no-EP0x83-data;
-  baseline reset on every start_streaming.
+  baseline reset on every start_streaming; `auto_reset=1` queues a safe
+  reset via `usb_queue_reset_device(dev->intf)`.
 
 ## 7. Pitfalls learned the hard way (check these before touching related code)
 
@@ -294,7 +296,7 @@ Decision tree (implement based ONLY on the result):
 2. Write the change + a rationale paragraph in `docs/DEVLOG.md` under a dated
    `### YYYY-MM-DD` heading, update the parity matrix row and the TODO
    checkbox with its acceptance criterion.
-3. Build (`make ... LLVM=1`), fix warnings; commit **one ticket per commit**.
+3. Build (`make`), fix warnings; commit **one ticket per commit**.
 4. Hand the install/test command block to the user (agent cannot sudo).
 5. Only after the user's positive report: flip the matrix cell to ✅.
 
@@ -313,19 +315,18 @@ Decision tree (implement based ONLY on the result):
 | BOOTSTRAP-PARITY | Diff 871-cmd replay vs `CRXADV7604`/`CLFE3` init in the `.sys` | resolved 2026-10-16: replay == reference capture (0 diffs), trim state-preserving (132 regs), EDID byte-identical to the vendor binaries — `tools/check_bootstrap.py` |
 | — | 2026-10-12 bug-hunt fixes (8 bugs: unload pin, adaptive-mode dead delivery, sequence race, adapter shared scratch mode, URB fail-path leak, status-work pre-init cancel, bootstrap scratch guard, audio hw_free barrier) | fixed + committed; see `### 2026-10-12 (late)` devlog entry |
 | — | 2026-10-13 bug-hunt & completion (DMA bounce buffers, inter-frame audio, alignment, colorspace auto-detection, ALSA 32k/44.1k/48k, EPIPE stall recovery, auto_reset watchdog) | fixed + compiled; see `### 2026-10-13` devlog entry |
+| — | 2026-10-16 (late) deep scan (16 items across parser, status, video, cvx8897, audio, usb + DKMS + `VIDIOC_LOG_STATUS` + `soft_unbind`) | fixed + compiled; see `### 2026-10-16 (late)` devlog entry |
 | — | Converter RGB-vs-422 (AVI colorspace flag) | ✅ auto-detected via HDMI 0x34 reg 0x53 (720p60 RGB table selected) |
 | — | Audio sample rates (32/44.1/48 kHz) | ✅ ALSA PCM constraints and hw_params expanded; sink pinned to the source rate from the Audio InfoFrame (2026-10-16) |
 | — | HDCP (implementation / interrogation / gating) | won't do (policy, docs only) — see README *Legal* |
 | — | Suspend/resume safe audio | ✅ SNDRV_PCM_INFO_PAUSE/RESUME, trigger ops, buffer_size ring alignment |
 
 Current module identity (for regression diffing): `srcversion
-5CFFCBFB67D12FA0BD04328` (overlays scaled to the frame on the macOS artwork,
-plus the source-paced audio rate, 2026-10-16 — see `docs/DEVLOG.md`
-"### 2026-10-16"), parms `cvx8897`,
+C18737C64885DAE764351AB` (2026-10-16 deep bug scan + DKMS + `VIDIOC_LOG_STATUS`
+— see `docs/DEVLOG.md` "### 2026-10-16 (late)"), parms `cvx8897`,
 `avm_audio`
 (bool, default off), `avm_audio_index`, `avm_audio_id`, `auto_reset`
 (bool, default off), `softdep: pre: snd-pcm`, 4×2 MB URBs.  `fix-driver.sh`
-
 expects this srcversion and prints the `rmmod -f` escape hatch if an
 old build's stray ref survives unbind.
 

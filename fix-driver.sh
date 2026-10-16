@@ -24,7 +24,7 @@ set -u
 
 MOD="avmcv710"
 DRV="/sys/bus/usb/drivers/$MOD"
-EXPECTED_SRC="7DF4E6E314E3990381E9E89"   # 2026-10-16 pass-3 deep-scan fixes
+EXPECTED_SRC="C18737C64885DAE764351AB"   # 2026-10-16 pass-4 deep-scan fixes
 
 [ "$(id -u)" -eq 0 ] || { echo "run as root (sudo ./fix-driver.sh)"; exit 1; }
 

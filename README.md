@@ -70,13 +70,24 @@ everything here.
 
 ## Build and install
 
-Out-of-tree against the running kernel. Kernels built with clang (CachyOS and
-others) must use `LLVM=1`; gcc cannot compile against clang-only flags.
+Out-of-tree against the running kernel. The `Makefile` inspects
+`$(KDIR)/include/config/auto.conf` for `CONFIG_CC_IS_CLANG=y` and sets
+`LLVM=1` automatically on Clang-built kernels (CachyOS and others), while
+building normally on GCC kernels.
 
 ```sh
-make KDIR=/lib/modules/$(uname -r)/build LLVM=1
-sudo make KDIR=/lib/modules/$(uname -r)/build LLVM=1 install
+make
+sudo make install
 sudo depmod -a && sudo modprobe avmcv710
+```
+
+Or install via **DKMS** so the module automatically rebuilds across kernel
+upgrades:
+
+```sh
+sudo make dkms-install
+# to remove later:
+sudo make dkms-remove
 ```
 
 Or, to free the device and reload cleanly in one step:
@@ -86,13 +97,12 @@ sudo ./fix-driver.sh                 # video-only module (audio off, the default
 sudo ./fix-driver.sh avm_audio=1     # with the ALSA capture card
 ```
 
-On gcc-built kernels plain `make` works. `fix-driver.sh` installs the tree
-build first whenever its `srcversion` differs from the loaded module, so "I
-edited it but nothing changed" cannot silently happen.
+`fix-driver.sh` installs the tree build first whenever its `srcversion` differs
+from the loaded module, so "I edited it but nothing changed" cannot silently
+happen.
 
-`avmcv710-bmp.h` and `avmcv710-cvx8897.h` are generated and gitignored. After a
-fresh clone run `python3 tools/gen_bmp.py` (and `python3 tools/gen_cvx8897.py`
-if the build asks for it) before building.
+`avmcv710-bmp.h` and `avmcv710-cvx8897.h` are generated and gitignored, and the
+`Makefile` regenerates them automatically before invoking Kbuild if missing.
 
 ## Test
 
@@ -100,14 +110,18 @@ if the build asks for it) before building.
 # after plugging in the CV710 (the journal shows "avmcv710: ... ready")
 v4l2-ctl --list-devices
 v4l2-ctl -d /dev/videoN --list-formats-ext
+v4l2-ctl -d /dev/videoN --log-status
 v4l2-ctl -d /dev/videoN --set-fmt-video=width=1920,height=1080,pixelformat=YUYV
 v4l2-ctl -d /dev/videoN --stream-mmap --stream-count=30 --stream-to=out.yuv
 ```
 
-`v4l2-ctl` prints dropped/received counts on exit; the internal parser counters
-(valid/dropped/corrupt/padded/resync) print on `STREAMOFF`. Pull the HDMI cable
-while streaming to see the no-signal overlay, and ask for a non-native size to
-see the out-of-range one. Logs go to `journalctl -k -f` (`dmesg` is not
+`v4l2-ctl --log-status` (`VIDIOC_LOG_STATUS`) dumps live receiver lock,
+measured geometry, colorspace, audio InfoFrame lock/rate, parser counters, and
+CVX8897 state to the kernel log (`journalctl -k`). `v4l2-ctl` prints
+dropped/received counts on exit; the internal parser counters
+(valid/dropped/corrupt/padded/resync) also print on `STREAMOFF`. Pull the HDMI
+cable while streaming to see the no-signal overlay, and ask for a non-native
+size to see the out-of-range one. Logs go to `journalctl -k -f` (`dmesg` is not
 readable on modern kernels).
 
 Geometry is auto-detected from the frame word count, so the driver delivers
@@ -122,7 +136,7 @@ output mode first.
 | `avm_audio` | bool, 0444 | `0` (off) | register the `AVMCV710` ALSA capture card at probe |
 | `avm_audio_index` | int, 0444 | `-1` | ALSA card index (`-1` = auto) |
 | `avm_audio_id` | charp, 0444 | `"AVMCV710"` | ALSA card id |
-| `auto_reset` | bool, 0644 | `0` (off) | watchdog may `usb_reset_device()` a silent stream |
+| `auto_reset` | bool, 0644 | `0` (off) | watchdog may `usb_queue_reset_device()` a silent stream |
 
 `MODULE_SOFTDEP("pre: snd-pcm")`, 4x2 MB URBs, `MODULE_LICENSE("GPL")`.
 
@@ -134,13 +148,14 @@ output mode first.
 | `avmcv710-hw.c` | bootstrap replay (EP1), I2C register access, FPGA work mode, DMA reset |
 | `avmcv710-parser.c` | C0/C1/audio framing parser, mode detect, reconcile, weaving, delivery |
 | `avmcv710-usb.c` | probe/disconnect, URB pipeline, parse workqueue, teardown, watchdog |
-| `avmcv710-video.c` | V4L2 + vb2 queue, format negotiation, streaming lifecycle |
+| `avmcv710-video.c` | V4L2 + vb2 queue, format negotiation, `VIDIOC_LOG_STATUS`, streaming lifecycle |
 | `avmcv710-cvx8897.c` | CVX8897 frame-rate converter (opt-in) |
 | `avmcv710-audio.c` | ALSA capture PCM (opt-in, S16LE stereo at the source rate) |
 | `avmcv710-status.c` | ADV7604 status poll (1 Hz), audio rate, standby overlays |
 | `avmcv710-bootstrap.h` | tracked, pre-parsed 871-command bootstrap table |
 | `avmcv710-bmp.h` | generated (gitignored) RLE standby overlays |
 | `avmcv710-cvx8897.h` | generated (gitignored) CVX8897 register tables |
+| `dkms.conf` | DKMS configuration (auto-generates headers and builds `avmcv710.ko`) |
 | `fix-driver.sh` | clean reload helper (closes OBS, checks `srcversion`, installs the tree build) |
 | `tools/gen_bootstrap.py` | generates `avmcv710-bootstrap.h` |
 | `tools/check_bootstrap.py` | verifies the bootstrap against the vendor binaries |

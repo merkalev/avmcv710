@@ -273,6 +273,73 @@ and — when the old build's invisible stray ref survives — prints the
 deliberate `sudo rmmod -f avmcv710 && sudo modprobe avmcv710` escape hatch
 instead of failing silently.
 
+### 2026-10-16 (late) — deep bug scan (4 passes), DKMS, VIDIOC_LOG_STATUS, soft_unbind
+
+Audit across `avmcv710-parser.c`, `-status.c`, `-video.c`, `-cvx8897.c`,
+`-audio.c`, `-usb.c` (`srcversion C18737C64885DAE764351AB`).  Descriptions
+below were checked against the commit diffs.
+
+**Parser (`avmcv710-parser.c`)**
+
+1. **`fields_woven` not cleared on non-woven exits.**  It was reset only on a
+   clean trailer.  A dropped/corrupt/mismatched field, a mode change or a bad
+   C1 left a stale half-frame count, so the next field could pair with a field
+   of a different frame.  Now cleared on every drop path, on mode lock, on a
+   bad-trailer C1 and after delivery.
+2. **Fallback mode table keyed on width.**  `switch (m->w)` collided: 720 is
+   the width of both 576 and 480 lines, so 480p/480i were unreachable.  The
+   table is now keyed on height.  The interlaced receiver-derived fallback now
+   computes field words from the field height (`sig.h` is already field height
+   when `<= 700`).
+3. **Adaptive `m->target` was `words`, not the nominal count.**  That made
+   `avm_reconcile_frame()` a no-op for non-table timings, so short/long frames
+   skipped pad/truncate.  Now `(u32)expected`.
+4. **Receiver-width cross-check** in the fallback table: a locked receiver
+   whose width contradicts the candidate mode rejects it (partial frames of a
+   resolution switch could match another mode's word window).
+5. **False `0x58FFFF00` marker inside video.**  When the following length
+   word failed audio validation, the word was *counted* (`frame_words++`) but
+   never copied, shifting the rest of the raster by one word.  It is now
+   stored as pixel data.
+6. **`avm_parser_reset()`**: `mode_serial` stays monotonic (a new stream can
+   no longer alias `cvx_prog_serial`), and `clock_recovering`,
+   `active_interlaced`, `target_words` are cleared.
+
+**Status / video**
+
+7. **Status worker backoff** no longer stretches the 33 ms tick (which also
+   pumps overlays) after repeated poll failures; only the ADV7604 poll backs
+   off.
+8. **`avm_signal_ok()` / `avm_live_geometry()` consistency.**  Both reject odd
+   widths, and both bound the *woven* frame (`h*2` for interlaced `h <= 700`)
+   against `AVM_MAX_FRAME_WORDS` (pass 4 fixed `avm_signal_ok()`, which
+   previously used the un-doubled height).  Oversized input reports 1920x1080
+   plus the out-of-range overlay.
+9. **`ENUM_FRAMESIZES`** skips table entries equal to the live size instead of
+   emitting a duplicate; **`ENUM_FRAMEINTERVALS`** offers native/2 only when a
+   CVX8897 table exists for that size/interlace.
+10. `G_FMT` now records the reported format in `dev->fmt`.
+11. `VIDIOC_LOG_STATUS` (`avm_log_status`) dumps stream, ADV7604, CVX8897 and
+    parser counters to the kernel log (`v4l2-ctl --log-status`).
+
+**Teardown / concurrency**
+
+12. **Watchdog `auto_reset`** now uses `usb_queue_reset_device(dev->intf)`
+    instead of calling `usb_reset_device()` from a work item.
+13. **`cvx_work` vs `STREAMOFF`:** `avm_stop_streaming()` cancels it and the
+    251-register upload checks `streaming` between writes.
+14. **`avm_audio_pcm_open()`** refuses with `-ENODEV` once `a->dying`.
+15. **`avm_usb_disconnect()`** parks the FPGA / resets stream DMA only if a
+    stream was active and the device is still attached (an idle or unplugged
+    device has nothing to park; the commands would just time out), and the
+    driver sets `.soft_unbind = 1`.
+
+**Build**
+
+16. `Makefile` auto-detects a clang-built kernel (`LLVM=1`), `dkms.conf` plus
+    `make dkms-install` / `dkms-remove`, `fix-driver.sh` no longer forces
+    `LLVM=1`.
+
 ### 2026-10-16: documentation, READMEs renovated, legal posture recorded
 
 Not a driver change.  Both READMEs were rewritten, and the HDCP ticket was

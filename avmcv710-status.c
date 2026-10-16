@@ -165,43 +165,98 @@ static bool avm_signal_ok(const struct avm_signal *sig)
 	return true;
 }
 
+/* Sample one luma byte from the decoded YUY2 sprite (source pixel coords). */
+static inline u32 avm_sprite_y(const u8 *bmp, u32 x, u32 y)
+{
+	u32 word = ((const u32 *)bmp)[y * (AVM_BMP_W / 2) + (x >> 1)];
+
+	return (x & 1) ? (word >> 16) & 0xFF : word & 0xFF;
+}
+
 /*
  * Composite the decoded bitmap for `kind` into a w x h YUY2 raster held in
- * dev->splash_frame.  Cached by (kind, w, h): the raster is rebuilt only when
- * the overlay kind or the live geometry changes.
+ * dev->splash_frame, **scaled to fill the frame**.
+ *
+ * The vendor ships the overlay as a 640x480 full-frame design - the macOS
+ * rendition even puts the AVerMedia logo in the corner of that canvas, so it
+ * is meant to be presented scaled, not blitted 1:1 (at 1080p a 1:1 blit would
+ * leave the card a ninth of the screen and the logo stranded mid-frame).  The
+ * vendor's host app paints it scaled into its window; a bare V4L2 frame has no
+ * scaler, so we do it here: uniform "contain" scaling (letterboxed with the
+ * same limited-range black), bilinear in luma, chroma from the nearest source
+ * macropixel.  Cached by (kind, w, h), so this runs once per geometry change,
+ * never per frame.
  */
 static u32 avm_splash_compose(struct avm_device *dev, enum avm_splash kind,
 			      u32 w, u32 h)
 {
 	const u8 *bmp = dev->sprite;
-	u32 words, x, y, cw, ch, row;
-	u32 dst_stride = w / 2;		/* YUY2 words per output line */
-	u32 src_stride = AVM_BMP_W / 2;	/* YUY2 words per bitmap line */
 	u8 *dst = dev->splash_frame;
+	u32 sc, dw, dh, ox, oy, dst_stride, words, j, m, i;
 
 	if (!bmp || !dst || !w || !h || (w & 1))
 		return 0;
 
 	words = (u32)((u64)w * h / 2);
-	if (words > AVM_MAX_FRAME_WORDS)
+	if (!words || words > AVM_MAX_FRAME_WORDS)
 		return 0;	/* unreachable: geometry is bounded above */
 
 	/* limited-range black background */
-	for (row = 0; row < words; row++)
-		((u32 *)dst)[row] = AVM_YUY2_BLACK;
+	for (i = 0; i < words; i++)
+		((u32 *)dst)[i] = AVM_YUY2_BLACK;
 
-	/* YUY2 blits must land on a macropixel (2-pixel) boundary */
-	x = w > AVM_BMP_W ? (w - AVM_BMP_W) / 2 : 0;
-	x &= ~1u;
-	y = h > AVM_BMP_H ? (h - AVM_BMP_H) / 2 : 0;
-	cw = min(w - x, AVM_BMP_W);	/* pixels, even by construction */
-	ch = min(h - y, AVM_BMP_H);	/* lines */
+	/* Uniform "contain" scale, Q16. */
+	sc = min((u32)(((u64)w << 16) / AVM_BMP_W),
+		 (u32)(((u64)h << 16) / AVM_BMP_H));
+	dw = (u32)(((u64)AVM_BMP_W * sc) >> 16) & ~1u;
+	dh = (u32)(((u64)AVM_BMP_H * sc) >> 16);
+	if (!dw || !dh || dw > w || dh > h)
+		return 0;
+	ox = ((w - dw) / 2) & ~1u;	/* keep macropixels aligned */
+	oy = (h - dh) / 2;
+	dst_stride = w / 2;
 
-	for (row = 0; row < ch; row++) {
-		const u32 *s = (const u32 *)bmp + row * src_stride;
-		u32 *d = (u32 *)dst + (y + row) * dst_stride + x / 2;
+	for (j = 0; j < dh; j++) {
+		u32 syf = (u32)(((u64)j * AVM_BMP_H << 16) / dh);
+		u32 y0 = min(syf >> 16, (u32)AVM_BMP_H - 1);
+		u32 y1 = min(y0 + 1, (u32)AVM_BMP_H - 1);
+		int fy = (int)(syf & 0xFFFF);
+		u32 *drow = (u32 *)dst + (oy + j) * dst_stride + ox / 2;
 
-		memcpy(d, s, cw * 2);
+		for (m = 0; m < dw / 2; m++) {
+			u32 ys[2], cb, cr, word;
+			int k;
+
+			for (k = 0; k < 2; k++) {
+				u32 sxf = (u32)(((u64)(2 * m + k) * AVM_BMP_W
+						 << 16) / dw);
+				u32 x0 = min(sxf >> 16, (u32)AVM_BMP_W - 1);
+				u32 x1 = min(x0 + 1, (u32)AVM_BMP_W - 1);
+				int fx = (int)(sxf & 0xFFFF);
+				int a = avm_sprite_y(bmp, x0, y0);
+				int b = avm_sprite_y(bmp, x1, y0);
+				int c = avm_sprite_y(bmp, x0, y1);
+				int d = avm_sprite_y(bmp, x1, y1);
+				int top = a + (((b - a) * fx) >> 16);
+				int bot = c + (((d - c) * fx) >> 16);
+
+				ys[k] = top + (((bot - top) * fy) >> 16);
+			}
+
+			/* chroma: nearest source macropixel on the top row */
+			{
+				u32 sxf = (u32)(((u64)(2 * m) * AVM_BMP_W
+						 << 16) / dw);
+				u32 mx = min(sxf >> 16, (u32)AVM_BMP_W - 1) >> 1;
+
+				word = ((const u32 *)bmp)[y0 * (AVM_BMP_W / 2)
+							  + mx];
+			}
+			cb = (word >> 8) & 0xFF;
+			cr = (word >> 24) & 0xFF;
+			drow[m] = (ys[0] & 0xFF) | (cb << 8) |
+				  ((ys[1] & 0xFF) << 16) | (cr << 24);
+		}
 	}
 
 	dev->splash_w = w;

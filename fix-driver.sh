@@ -24,7 +24,7 @@ set -u
 
 MOD="avmcv710"
 DRV="/sys/bus/usb/drivers/$MOD"
-EXPECTED_SRC="6509F7D25BFA05CB7C32311"   # 2026-10-16 overlays restored + non-native out-of-range
+EXPECTED_SRC="27DFE0F25007224D8224D56"   # 2026-10-16 overlays: scaled composite (macOS artwork)
 
 [ "$(id -u)" -eq 0 ] || { echo "run as root (sudo ./fix-driver.sh)"; exit 1; }
 

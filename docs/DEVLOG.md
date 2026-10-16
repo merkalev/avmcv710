@@ -272,6 +272,33 @@ and — when the old build's invisible stray ref survives — prints the
 deliberate `sudo rmmod -f avmcv710 && sudo modprobe avmcv710` escape hatch
 instead of failing silently.
 
+### 2026-10-16 — overlay presentation: scale to the frame, macOS artwork
+
+Two corrections to the restored overlays, both from user feedback ("had to
+close OBS for YouTube to play" is unrelated; "windows driver is higher res
+but no branding, macOS has branding" is the one that matters here).
+
+**1. The overlay is a full-frame design and must be scaled.**  Both vendor
+bitmaps are exactly 640x480x24 (neither is "higher resolution" than the
+other — the Windows *design* just draws a bigger panel inside the same
+canvas).  Crucially, neither binary embeds or even names the `.bmp` files:
+they are host-application assets, and the macOS rendition puts the AVerMedia
+logo in the *corner of the 640x480 canvas*, which only makes sense if the
+whole canvas is presented scaled.  The first cut blitted it 1:1 centred, so
+at 1080p the card covered a ninth of the frame and the logo floated
+mid-screen.  `avm_splash_compose()` now scales uniformly to fit ("contain",
+black letterbox, bilinear luma, nearest-macropixel chroma) — at 1080p that is
+a 1440x1080 card centred with 240px bars, and the logo lands at the corner of
+the card.  This is cached by geometry, so it is computed once, not per frame.
+
+**2. Source = the macOS rendition** (`cv710userspace/assets/`), because it is
+the branded presentation and lives in-tree.  The Windows copy
+(`driver_extracted/win/`) is still one argument away; it is also dirtier (a
+dithered gradient vs a flat panel), so it RLEs to 92 174 runs / 1.41 MB versus
+43 316 / 0.66 MB.  `srcversion` tracks the kernel sources, not the generated
+header, so the artwork swap alone did not move it — the scaler change did
+(now `27DFE0F25007224D8224D56`).
+
 ### 2026-10-16 — BOOTSTRAP-PARITY: the 871-command replay vs the vendor init
 
 Ticket: "Diff 871-cmd replay vs `CRXADV7604`/`CLFE3` init in `avmu3_x64.sys`."
@@ -344,8 +371,15 @@ Data (`tools/gen_bmp.py`):
   kernel sources, not the generated header, so a bitmap-only change does not
   perturb it — verify visually.)
 - `avm_splash_expand()` decodes the RLE into a per-device 640x480 sprite once
-  per kind; `avm_splash_compose()` blits it centred on a limited-range black
-  raster at the live geometry (cached by kind + geometry).
+  per kind; `avm_splash_compose()` **scales it to fill the frame** (uniform
+  "contain", letterboxed with black, bilinear in luma, chroma from the nearest
+  source macropixel) and caches by (kind, geometry).  The overlay is a 640x480
+  *full-frame* design — the macOS rendition puts the AVerMedia logo in the
+  corner of that canvas — and the vendor's host app paints it scaled into its
+  window, so blitting 1:1 (the first cut) left the card a ninth of a 1080p
+  frame with the logo stranded mid-screen; at 1080p this now renders a
+  1440x1080 card centred in the frame.  The scaling runs once per geometry
+  change, never per frame (the composite is cached).
 
 Delivery (`avmcv710-status.c`):
 - The status work now ticks at ~30 Hz but keeps the gentle **1 Hz** ADV7604

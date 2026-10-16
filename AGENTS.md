@@ -239,9 +239,10 @@ Decision tree (implement based ONLY on the result):
   `dev->sig` before the first frame locks, then 1920x1080.
 - **Overlays (TODO-3, RESTORED 2026-10-16):** the status worker composites one
   of the vendor's four 640x480 bitmaps (RLE-decoded from `avmcv710-bmp.h` at
-  the live geometry; the file is generated from the **macOS** rendition in
-  `cv710userspace/assets/` — see `tools/gen_bmp.py`) and delivers it through
-  `avm_deliver_frame()` when the
+  the live geometry, then **scaled to fill the frame** — uniform "contain",
+  black letterbox, bilinear luma; the file is generated from the **macOS**
+  rendition in `cv710userspace/assets/` — see `tools/gen_bmp.py`) and delivers
+  it through `avm_deliver_frame()` when the
   stream has been idle > 250 ms (TMDS unlocked → no-signal; locked but out of
   range → out-of-range) **and** when a consumer negotiated a non-native
   geometry the FPGA cannot scale to (`avm_req_mismatch`; the parser drops live
@@ -316,7 +317,7 @@ Decision tree (implement based ONLY on the result):
 | — | Suspend/resume safe audio | ✅ SNDRV_PCM_INFO_PAUSE/RESUME, trigger ops, buffer_size ring alignment |
 
 Current module identity (for regression diffing): `srcversion
-6509F7D25BFA05CB7C32311` (overlays restored + non-native out-of-range,
+27DFE0F25007224D8224D56` (overlays scaled to the frame, macOS artwork,
 2026-10-16 — see `docs/DEVLOG.md` "### 2026-10-16"), parms `cvx8897`,
 `avm_audio`
 (bool, default off), `avm_audio_index`, `avm_audio_id`, `auto_reset`

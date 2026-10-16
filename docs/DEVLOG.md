@@ -995,3 +995,41 @@ ship; C877 is the CV710.)
   (`f4c24ad`): window ~2.5 s, divide by `fps_cnt - 1`, round to nearest,
   ignore ±1 flaps.  Delivery was always exactly 1 frame/C1.
 - Latency: 4 URBs ≈ 1 frame of pre-buffer slack (~33 ms); ≥6 restored latency.
+
+---
+
+### 2026-10-16 (evening) — OBS Parity, 1:1 Centered Overlays, Anti-Popping, Anti-Drift
+
+1. **Standby BMP Presentation (1:1 Centered, Not Enlarged):**
+   - Replaced bilinear "contain" scaling in `avm_splash_compose()` with 1:1 pixel-perfect centered blitting.
+   - The 640×480 standby sprite is composited into the center of the limited-range black canvas (`AVM_YUY2_BLACK`), preserving original pixel aspect without stretching or blur.
+   - Target geometry in `avm_splash_tick()` uses `req_w x req_h` when set by OBS, ensuring payload matches the buffer size OBS allocated for non-native modes.
+
+2. **Overlay Second-Time Loss Fix:**
+   - Root cause: when the HDMI source was powered off after a streaming session, the ADV7604/FPGA continued generating free-run frames. `avm_detect_mode()` accepted these word counts and updated `p->last_real_kt = ktime_get()`, so the stream was never marked idle and the standby splash never fired on subsequent disconnects.
+   - Fix: `avm_handle_frame_end()` now explicitly gates on `dev->sig.valid && dev->sig.tmds_locked`. When TMDS is unlocked, free-run/noise frames are dropped and `last_real_kt` is not refreshed, allowing the standby overlay to cleanly display every time.
+
+3. **Framerate Variety & 24 FPS Drop (Windows Driver Parity):**
+   - `avm_enum_frameintervals()` now enumerates standard discrete frame rates: `60, 59.94, 50, 30, 29.97, 25, 24, 23.98, 15` fps.
+   - `cvx8897` converter parameter defaulted to 1 (on).
+   - `avm_s_parm()` snaps requested `timeperframe` to the closest standard discrete interval, requests rate conversion from CVX8897, and echoes back the accepted interval.
+   - Matching Windows driver behavior: when 24 fps is requested from a >30 fps source (e.g. 1080p60), `avm_handle_frame_end()` drops the frames to a black screen while refreshing `last_real_kt` (preventing "No Signal" overlay). Live video instantly resumes upon increasing FPS.
+
+4. **Resolution Selection & Out of Range Overlay:**
+   - `avm_try_fmt()` now accepts standard resolutions (`1920x1080, 1280x720, 720x576, 720x480, 640x480`) as well as the native detected geometry.
+   - In `avm_s_fmt()`, if the negotiated resolution differs from native, `req_w` and `req_h` are latched; the parser drops mismatched frames, and `avm_splash_tick()` renders the official AVerMedia "Signal Out of Range" overlay at that negotiated geometry.
+   - Selecting "Device Default / Leave Unchanged" in OBS clears `req_w/req_h` back to 0, seamlessly tracking native source resolution.
+
+5. **Audio Popping on Disconnect Elimination:**
+   - Root cause: `avm_audio_muted()` previously only checked `dev->sig.valid && !dev->sig.tmds_locked`, which is only polled every 1000 ms. When HDMI power was lost, floating bus noise poured into the ALSA buffer for up to a full second before the poll detected unlock.
+   - Fix: `avm_audio_muted()` now mutes immediately when:
+     - Stream parser loses initial lock (`!p->stream_locked`).
+     - FPGA indicates clock/PLL recovery (`p->clock_recovering`).
+     - Fewer than 2 consecutive valid video frames have arrived (`p->consecutive_valid < 2`).
+     - No valid video frame has arrived for > 150 ms (`idle > 150 ms`).
+   - Muted state writes clean silence (`memset 0`) while maintaining ALSA ring timing.
+
+6. **Audio Latency Drift Elimination:**
+   - Added `AVM_AUDIO_BUFFER_MIN = 32768` constraint and increased `AVM_AUDIO_PERIOD_MIN = 4096`.
+   - Ring buffer is now guaranteed to be >= 4x the maximum FX3 audio packet size (8192 bytes), preventing `bytes > size` packet truncation and sample-drop latency drift.
+   - `avm_audio_pcm_prepare()` resets `a->base = 0` so capture always begins frame-aligned.

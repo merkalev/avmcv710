@@ -127,6 +127,7 @@ struct avm_parser {
 	bool in_audio;
 	bool in_audio_padding;
 	bool clock_recovering;
+	u32 consecutive_valid;
 
 	/* audio payload remaining across chunk boundary */
 	u32 remaining_audio_words;
@@ -228,6 +229,7 @@ struct avm_device {
 	 * the vendor's "signal out of range" overlay instead of live frames
 	 * (avm_req_mismatch()).  0/0 = follow the source. */
 	u32 req_w, req_h;
+	struct v4l2_fract req_tpf;
 
 	/* serializes EP1 control traffic (I2C reads/writes are
 	 * command+response pairs and must stay atomic) */

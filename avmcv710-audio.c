@@ -50,7 +50,8 @@ MODULE_SOFTDEP("pre: snd-pcm");
 #define AVM_AUDIO_RATE		AVM_AUDIO_RATE_DEFAULT
 #define AVM_AUDIO_CHANNELS	2	/* S16LE interleaved stereo */
 #define AVM_AUDIO_RING_BYTES	(1u << 20) /* PCM buffer max: ~5.5 s @ 48k */
-#define AVM_AUDIO_PERIOD_MIN	1920	/* 10 ms @ 48k/2ch/S16LE */
+#define AVM_AUDIO_BUFFER_MIN	32768	/* ensure ring >= 4x max 8192 B packet */
+#define AVM_AUDIO_PERIOD_MIN	4096	/* ~21.3 ms @ 48k/2ch/S16LE */
 
 static bool avm_audio = true;	/* default 1=on: hardware-verified 2026-10-16 */
 module_param(avm_audio, bool, 0444);
@@ -165,6 +166,10 @@ static int avm_audio_pcm_open(struct snd_pcm_substream *subs)
 	snd_pcm_hw_constraint_integer(subs->runtime,
 				      SNDRV_PCM_HW_PARAM_PERIODS);
 	/* payload and period sizes stay frame-aligned (4 B S16LE stereo) */
+	snd_pcm_hw_constraint_minmax(subs->runtime,
+				      SNDRV_PCM_HW_PARAM_BUFFER_BYTES,
+				      AVM_AUDIO_BUFFER_MIN,
+				      AVM_AUDIO_RING_BYTES);
 	snd_pcm_hw_constraint_step(subs->runtime, 0,
 				   SNDRV_PCM_HW_PARAM_PERIOD_BYTES, 4);
 	snd_pcm_hw_constraint_step(subs->runtime, 0,
@@ -208,18 +213,12 @@ static int avm_audio_pcm_hw_params(struct snd_pcm_substream *subs,
 
 static int avm_audio_pcm_prepare(struct snd_pcm_substream *subs)
 {
-	/*
-	 * Mandatory, not optional: snd_pcm_do_prepare() calls
-	 * ops->prepare() without a NULL check (sound/core/pcm_native.c).
-	 * A NULL op here is an instruction fetch at RIP 0x0 - exactly the
-	 * oops WirePlumber hit the moment the card registered (it opens +
-	 * PREPAREs every capture PCM to enumerate it), which then killed
-	 * the whole audio graph minutes later.
-	 *
-	 * Everything the sink needs is pinned by the constraint set and
-	 * re-checked in hw_params; the push path re-validates the runtime
-	 * on every packet.  Nothing left to do but exist.
-	 */
+	struct avm_audio *a = snd_pcm_substream_chip(subs);
+	unsigned long flags;
+
+	spin_lock_irqsave(&a->lock, flags);
+	a->base = 0;
+	spin_unlock_irqrestore(&a->lock, flags);
 	return 0;
 }
 
@@ -328,22 +327,48 @@ static const struct snd_pcm_ops avm_audio_ops = {
 /* Parser entry: push captured 0x58 payload bytes into the PCM buffer  */
 
 /*
- * While the receiver is known to be unlocked the FX3 FIFO streams bus noise
- * in the 0x58 packets (cv710userspace ISSUES.md section 4: the "audio
- * buzzing" bug, fixed there by a video-lock gate).  The PCM must keep its
- * timing - capture clients expect a steady pointer - so the noise is replaced
- * by silence rather than dropped.  Only a *positive* unlock mutes: before the
- * first status poll (sig.valid false) or if the poll fails, audio passes.
+ * Immediate audio muting on signal loss / mode transition:
+ * While the receiver is unlocked, clock is recovering, or valid video frames
+ * have stopped arriving, the FX3 FIFO streams floating bus noise in the 0x58
+ * packets (cv710userspace ISSUES.md section 4: "audio buzzing / popping").
+ * The PCM must keep its timing - capture clients expect a steady pointer -
+ * so the noise is replaced by silence rather than dropped.
  */
 static bool avm_audio_muted(struct avm_device *dev)
 {
+	struct avm_parser *p = &dev->parser;
 	unsigned long flags;
-	bool muted;
+	bool sig_valid, tmds_locked;
+	ktime_t idle;
 
 	spin_lock_irqsave(&dev->sig_lock, flags);
-	muted = dev->sig.valid && !dev->sig.tmds_locked;
+	sig_valid = dev->sig.valid;
+	tmds_locked = dev->sig.tmds_locked;
 	spin_unlock_irqrestore(&dev->sig_lock, flags);
-	return muted;
+
+	/* Positive TMDS unlock reported by ADV7604 */
+	if (sig_valid && !tmds_locked)
+		return true;
+
+	/* Stream parser has lost initial lock */
+	if (!READ_ONCE(p->stream_locked))
+		return true;
+
+	/* FPGA HDMI clock/PLL recovering */
+	if (READ_ONCE(p->clock_recovering))
+		return true;
+
+	/* Require at least 2 consecutive valid video frames before unmuting */
+	if (READ_ONCE(p->consecutive_valid) < 2)
+		return true;
+
+	/* Watchdog: if no valid frame reached C1 for > 150 ms, mute immediately
+	 * before floating bus noise pours into the PCM buffer */
+	idle = ktime_sub(ktime_get(), READ_ONCE(p->last_real_kt));
+	if (ktime_to_ms(idle) > 150)
+		return true;
+
+	return false;
 }
 
 void avm_audio_push(struct avm_device *dev, const u8 *src, u32 bytes)

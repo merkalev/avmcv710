@@ -24,7 +24,7 @@ set -u
 
 MOD="avmcv710"
 DRV="/sys/bus/usb/drivers/$MOD"
-EXPECTED_SRC="56AE8A23F24FC5CD731077E"   # 2026-10-16 audio enabled by default (hw verified)
+EXPECTED_SRC="A15744791304F510C99C86E"   # 2026-10-16 OBS fps/res parity, 1:1 centered BMPs, anti-pop/drift
 
 [ "$(id -u)" -eq 0 ] || { echo "run as root (sudo ./fix-driver.sh)"; exit 1; }
 

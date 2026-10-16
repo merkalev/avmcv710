@@ -180,31 +180,94 @@ static int avm_g_fmt(struct file *file, void *fh, struct v4l2_format *f)
 	return 0;
 }
 
+static const struct {
+	u32 width;
+	u32 height;
+} avm_frame_sizes[] = {
+	{ 1920, 1080 },
+	{ 1280,  720 },
+	{  720,  576 },
+	{  720,  480 },
+	{  640,  480 },
+};
+
+static const struct v4l2_fract avm_frame_intervals[] = {
+	{    1,    60 },	/* 60 fps */
+	{ 1001, 60000 },	/* 59.94 fps */
+	{    1,    50 },	/* 50 fps */
+	{    1,    30 },	/* 30 fps */
+	{ 1001, 30000 },	/* 29.97 fps */
+	{    1,    25 },	/* 25 fps */
+	{    1,    24 },	/* 24 fps */
+	{ 1001, 24000 },	/* 23.98 fps */
+	{    1,    15 },	/* 15 fps */
+};
+
 static int avm_try_fmt(struct file *file, void *fh, struct v4l2_format *f)
 {
 	struct avm_device *dev = video_drvdata(file);
 	struct v4l2_pix_format *pix = &f->fmt.pix;
+	u32 live_w, live_h;
+	u32 req_w = pix->width, req_h = pix->height;
+	u32 best_w, best_h;
+	u8 cs = 0xFF;
+	unsigned long flags;
+	int i;
 
 	if (f->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 		return -EINVAL;
 
-	/*
-	 * Source-paced: the geometry is whatever the HDMI source locks, so a
-	 * requested size cannot be honoured.  Always report the current
-	 * geometry so the negotiated bytesperline/sizeimage match what the
-	 * parser actually delivers - otherwise a consumer that asked for
-	 * 1920x1080 but receives a 1366x768 payload would read it with the
-	 * wrong stride and shear the picture.  A consumer learns about a
-	 * change through V4L2_EVENT_SOURCE_CHANGE and re-queries g_fmt.
-	 */
-	avm_pixfmt(dev, pix);
+	avm_live_geometry(dev, &live_w, &live_h);
+
+	spin_lock_irqsave(&dev->sig_lock, flags);
+	if (dev->sig.valid)
+		cs = dev->sig.colorspace;
+	spin_unlock_irqrestore(&dev->sig_lock, flags);
+
+	best_w = live_w;
+	best_h = live_h;
+	if (req_w == live_w && req_h == live_h) {
+		best_w = live_w;
+		best_h = live_h;
+	} else {
+		for (i = 0; i < ARRAY_SIZE(avm_frame_sizes); i++) {
+			if (req_w == avm_frame_sizes[i].width &&
+			    req_h == avm_frame_sizes[i].height) {
+				best_w = req_w;
+				best_h = req_h;
+				break;
+			}
+		}
+	}
+
+	pix->width = best_w;
+	pix->height = best_h;
+	pix->pixelformat = V4L2_PIX_FMT_YUYV;
+	pix->field = V4L2_FIELD_NONE;
+	pix->bytesperline = best_w * 2;
+	pix->sizeimage = best_w * best_h * 2;
+
+	if (best_h > 576) {
+		pix->colorspace = V4L2_COLORSPACE_REC709;
+		pix->ycbcr_enc = V4L2_YCBCR_ENC_709;
+		pix->xfer_func = V4L2_XFER_FUNC_709;
+	} else {
+		pix->colorspace = V4L2_COLORSPACE_SMPTE170M;
+		pix->ycbcr_enc = V4L2_YCBCR_ENC_601;
+		pix->xfer_func = V4L2_XFER_FUNC_DEFAULT;
+	}
+	if (cs == 1 || cs == 6 || cs == 7)
+		pix->quantization = V4L2_QUANTIZATION_FULL_RANGE;
+	else
+		pix->quantization = V4L2_QUANTIZATION_LIM_RANGE;
+	pix->priv = 0;
 	return 0;
 }
 
 static int avm_s_fmt(struct file *file, void *fh, struct v4l2_format *f)
 {
 	struct avm_device *dev = video_drvdata(file);
-	u32 req_w, req_h;
+	u32 live_w, live_h;
 	int ret;
 
 	if (f->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
@@ -212,27 +275,23 @@ static int avm_s_fmt(struct file *file, void *fh, struct v4l2_format *f)
 	if (vb2_is_busy(&dev->q))
 		return -EBUSY;
 
-	/*
-	 * Remember what the consumer asked for.  The FPGA cannot scale, so a
-	 * request S_FMT could not honour means "the consumer is forcing a
-	 * geometry the source cannot provide" - the vendor answers that with
-	 * the "signal out of range" overlay, and so do we (avm_req_mismatch()).
-	 * A request that was already the reported geometry is not a forced
-	 * pick and clears any stale mismatch, so a consumer that simply
-	 * accepts the device format (the common case) always sees live video
-	 * even after the source changes geometry.
-	 */
-	req_w = f->fmt.pix.width;
-	req_h = f->fmt.pix.height;
-
 	ret = avm_try_fmt(file, fh, f);
 	if (ret)
 		return ret;
 	dev->fmt = f->fmt.pix;
 
-	if (req_w != f->fmt.pix.width || req_h != f->fmt.pix.height) {
-		WRITE_ONCE(dev->req_w, req_w);
-		WRITE_ONCE(dev->req_h, req_h);
+	avm_live_geometry(dev, &live_w, &live_h);
+
+	/*
+	 * If the consumer negotiated a geometry different from the live HDMI
+	 * source, record req_w/req_h so the standby overlay pump delivers
+	 * the official "signal out of range" splash at that geometry.
+	 * If the consumer accepts the live source geometry (e.g. Device Default),
+	 * clear req_w/req_h to 0 so the capture pipe seamlessly tracks the source.
+	 */
+	if (f->fmt.pix.width != live_w || f->fmt.pix.height != live_h) {
+		WRITE_ONCE(dev->req_w, f->fmt.pix.width);
+		WRITE_ONCE(dev->req_h, f->fmt.pix.height);
 	} else {
 		WRITE_ONCE(dev->req_w, 0);
 		WRITE_ONCE(dev->req_h, 0);
@@ -262,17 +321,6 @@ static int avm_s_input(struct file *file, void *fh, unsigned int index)
 {
 	return index == 0 ? 0 : -EINVAL;
 }
-
-static const struct {
-	u32 width;
-	u32 height;
-} avm_frame_sizes[] = {
-	{ 1920, 1080 },
-	{ 1280,  720 },
-	{  720,  576 },
-	{  720,  480 },
-	{  640,  480 },
-};
 
 static int avm_enum_framesizes(struct file *file, void *fh,
 			       struct v4l2_frmsizeenum *fsize)
@@ -338,44 +386,21 @@ static void avm_current_interval(struct avm_device *dev,
 }
 
 /*
- * Frame-interval menu.  The source paces the cadence and the FPGA cannot
- * synthesise new rates; the only rates this device can actually deliver are
- * the measured native rate and - when the CVX8897 converter is enabled - its
- * half.  That is the vendor's discrete "Video Input Frame Rate" choice
- * (60p/30p/50p/25p, avmcv710-cvx8897.c).  The old fixed 7-entry menu was
- * dishonest: S_PARM can only halve, so 24 / 59.94 / 29.97 silently did
- * nothing and OBS offered rates the hardware can never produce.
+ * Frame-interval menu.  Enumerates the standard suite of framerates matching
+ * the official Windows driver (60, 59.94, 50, 30, 29.97, 25, 24, 23.98, 15).
  */
 static int avm_enum_frameintervals(struct file *file, void *fh,
 				   struct v4l2_frmivalenum *fiv)
 {
-	struct avm_device *dev = video_drvdata(file);
-	u32 fps;
-
 	if (fiv->pixel_format != V4L2_PIX_FMT_YUYV)
 		return -EINVAL;
 
-	fps = avm_native_fps(dev);
+	if (fiv->index >= ARRAY_SIZE(avm_frame_intervals))
+		return -EINVAL;
 
 	fiv->type = V4L2_FRMIVAL_TYPE_DISCRETE;
-	fiv->discrete.numerator = 1;
-
-	switch (fiv->index) {
-	case 0:
-		fiv->discrete.denominator = fps;
-		return 0;
-	case 1:
-		/* the half rate is real only with the hardware converter on
-		 * and when a CVX8897 table exists for the requested mode */
-		if (!avm_cvx8897_enabled() || (fps % 2) ||
-		    !avm_cvx8897_half_rate(fiv->width, fiv->height, fps, false,
-					   READ_ONCE(dev->parser.active_interlaced)))
-			return -EINVAL;
-		fiv->discrete.denominator = fps / 2;
-		return 0;
-	default:
-		return -EINVAL;
-	}
+	fiv->discrete = avm_frame_intervals[fiv->index];
+	return 0;
 }
 
 static int avm_g_parm(struct file *file, void *fh, struct v4l2_streamparm *p)
@@ -386,25 +411,46 @@ static int avm_g_parm(struct file *file, void *fh, struct v4l2_streamparm *p)
 		return -EINVAL;
 	p->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
 	p->parm.capture.readbuffers = 4;
-	avm_current_interval(dev, &p->parm.capture.timeperframe);
+	if (dev->req_tpf.numerator && dev->req_tpf.denominator)
+		p->parm.capture.timeperframe = dev->req_tpf;
+	else
+		avm_current_interval(dev, &p->parm.capture.timeperframe);
 	return 0;
 }
 
 static int avm_s_parm(struct file *file, void *fh, struct v4l2_streamparm *p)
 {
 	struct avm_device *dev = video_drvdata(file);
+	struct v4l2_fract *tpf = &p->parm.capture.timeperframe;
+	u32 req_fps = 0;
+	int i, best = 0;
+	u64 min_diff = U64_MAX;
 
 	if (p->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 		return -EINVAL;
-	/*
-	 * The source paces the cadence, but the CVX8897 can halve it in
-	 * hardware.  Record the requested rate so the converter worker can
-	 * pick the matching half-rate table (or stay native).
-	 */
-	if (p->parm.capture.timeperframe.numerator)
-		avm_cvx8897_request_fps(dev,
-			p->parm.capture.timeperframe.denominator /
-			p->parm.capture.timeperframe.numerator);
+
+	if (tpf->numerator && tpf->denominator) {
+		u64 req_us = (u64)tpf->numerator * 1000000ULL / tpf->denominator;
+
+		for (i = 0; i < ARRAY_SIZE(avm_frame_intervals); i++) {
+			u64 cand_us = (u64)avm_frame_intervals[i].numerator * 1000000ULL /
+				      avm_frame_intervals[i].denominator;
+			u64 diff = (req_us > cand_us) ? (req_us - cand_us) : (cand_us - req_us);
+
+			if (diff < min_diff) {
+				min_diff = diff;
+				best = i;
+			}
+		}
+		dev->req_tpf = avm_frame_intervals[best];
+		req_fps = dev->req_tpf.denominator / dev->req_tpf.numerator;
+	} else {
+		dev->req_tpf = avm_frame_intervals[0];
+		req_fps = 60;
+	}
+
+	WRITE_ONCE(dev->cvx_req_fps, req_fps);
+	avm_cvx8897_request_fps(dev, req_fps);
 	return avm_g_parm(file, fh, p);
 }
 

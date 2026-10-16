@@ -184,10 +184,10 @@ const u8 *avm_cvx8897_half_rate(u32 w, u32 h, u32 fps, bool rgb, bool interlaced
  * halve the rate when the consumer asks for about half the source rate.
  * Writable at runtime via /sys/module/avmcv710/parameters/cvx8897.
  */
-static int cvx8897;
+static int cvx8897 = 1;
 module_param(cvx8897, int, 0644);
 MODULE_PARM_DESC(cvx8897,
-	"CVX8897 frame-rate conversion: 0=off (default), 1=follow s_parm");
+	"CVX8897 frame-rate conversion: 1=on (default), 0=off");
 
 bool avm_cvx8897_enabled(void)
 {
@@ -214,9 +214,11 @@ static void avm_cvx_work(struct work_struct *work)
 	serial = READ_ONCE(p->mode_serial);
 	req = READ_ONCE(dev->cvx_req_fps);
 
-	/* Need a locked geometry and a measured rate. */
-	if (!w || !h || !in_fps)
+	/* Need a locked geometry. */
+	if (!w || !h)
 		return;
+	if (!in_fps)
+		in_fps = 60;	/* default nominal rate until measured */
 
 	/*
 	 * While halving, measured_fps is the delivered rate; recover the input

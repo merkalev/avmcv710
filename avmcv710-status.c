@@ -255,98 +255,50 @@ static bool avm_signal_ok(const struct avm_signal *sig)
 	return true;
 }
 
-/* Sample one luma byte from the decoded YUY2 sprite (source pixel coords). */
-static inline u32 avm_sprite_y(const u8 *bmp, u32 x, u32 y)
-{
-	u32 word = ((const u32 *)bmp)[y * (AVM_BMP_W / 2) + (x >> 1)];
-
-	return (x & 1) ? (word >> 16) & 0xFF : word & 0xFF;
-}
-
 /*
  * Composite the decoded bitmap for `kind` into a w x h YUY2 raster held in
- * dev->splash_frame, **scaled to fill the frame**.
+ * dev->splash_frame, 1:1 pixel-centered, unscaled (no enlargement).
  *
- * The vendor ships the overlay as a 640x480 full-frame design - the macOS
- * rendition even puts the AVerMedia logo in the corner of that canvas, so it
- * is meant to be presented scaled, not blitted 1:1 (at 1080p a 1:1 blit would
- * leave the card a ninth of the screen and the logo stranded mid-frame).  The
- * vendor's host app paints it scaled into its window; a bare V4L2 frame has no
- * scaler, so we do it here: uniform "contain" scaling (letterboxed with the
- * same limited-range black), bilinear in luma, chroma from the nearest source
- * macropixel.  Cached by (kind, w, h), so this runs once per geometry change,
- * never per frame.
+ * The official bitmaps are 640x480.  Instead of scaling up to 1080p (which
+ * enlarges artifacts and shifts positioning), we paint a limited-range black
+ * raster (Y=16, U=V=128) and blit the 640x480 sprite directly 1:1 into the
+ * exact center of the frame.  If the negotiated frame is smaller than 640x480,
+ * the sprite is cropped symmetrically around the center.
  */
 static u32 avm_splash_compose(struct avm_device *dev, enum avm_splash kind,
 			      u32 w, u32 h)
 {
 	const u8 *bmp = dev->sprite;
 	u8 *dst = dev->splash_frame;
-	u32 sc, dw, dh, ox, oy, dst_stride, words, j, m, i;
+	u32 dw, dh, ox, oy, sx, sy, words, i, j;
 
 	if (!bmp || !dst || !w || !h || (w & 1))
 		return 0;
 
 	words = (u32)((u64)w * h / 2);
 	if (!words || words > AVM_MAX_FRAME_WORDS)
-		return 0;	/* unreachable: geometry is bounded above */
+		return 0;
 
 	/* limited-range black background */
 	for (i = 0; i < words; i++)
 		((u32 *)dst)[i] = AVM_YUY2_BLACK;
 
-	/* Uniform "contain" scale, Q16. */
-	sc = min((u32)(((u64)w << 16) / AVM_BMP_W),
-		 (u32)(((u64)h << 16) / AVM_BMP_H));
-	dw = (u32)(((u64)AVM_BMP_W * sc) >> 16) & ~1u;
-	dh = (u32)(((u64)AVM_BMP_H * sc) >> 16);
-	if (!dw || !dh || dw > w || dh > h)
+	dw = min_t(u32, w, (u32)AVM_BMP_W) & ~1u;
+	dh = min_t(u32, h, (u32)AVM_BMP_H);
+	if (!dw || !dh)
 		return 0;
-	ox = ((w - dw) / 2) & ~1u;	/* keep macropixels aligned */
+
+	ox = ((w - dw) / 2) & ~1u;	/* macropixel aligned */
 	oy = (h - dh) / 2;
-	dst_stride = w / 2;
+
+	sx = ((AVM_BMP_W - dw) / 2) & ~1u;
+	sy = (AVM_BMP_H - dh) / 2;
 
 	for (j = 0; j < dh; j++) {
-		u32 syf = (u32)(((u64)j * AVM_BMP_H << 16) / dh);
-		u32 y0 = min(syf >> 16, (u32)AVM_BMP_H - 1);
-		u32 y1 = min(y0 + 1, (u32)AVM_BMP_H - 1);
-		int fy = (int)(syf & 0xFFFF);
-		u32 *drow = (u32 *)dst + (oy + j) * dst_stride + ox / 2;
+		u32 *drow = (u32 *)dst + (oy + j) * (w / 2) + (ox / 2);
+		const u32 *srow = (const u32 *)bmp + (sy + j) * (AVM_BMP_W / 2) + (sx / 2);
 
-		for (m = 0; m < dw / 2; m++) {
-			u32 ys[2], cb, cr, word;
-			int k;
-
-			for (k = 0; k < 2; k++) {
-				u32 sxf = (u32)(((u64)(2 * m + k) * AVM_BMP_W
-						 << 16) / dw);
-				u32 x0 = min(sxf >> 16, (u32)AVM_BMP_W - 1);
-				u32 x1 = min(x0 + 1, (u32)AVM_BMP_W - 1);
-				int fx = (int)(sxf & 0xFFFF);
-				int a = avm_sprite_y(bmp, x0, y0);
-				int b = avm_sprite_y(bmp, x1, y0);
-				int c = avm_sprite_y(bmp, x0, y1);
-				int d = avm_sprite_y(bmp, x1, y1);
-				int top = a + (((b - a) * fx) >> 16);
-				int bot = c + (((d - c) * fx) >> 16);
-
-				ys[k] = top + (((bot - top) * fy) >> 16);
-			}
-
-			/* chroma: nearest source macropixel on the top row */
-			{
-				u32 sxf = (u32)(((u64)(2 * m) * AVM_BMP_W
-						 << 16) / dw);
-				u32 mx = min(sxf >> 16, (u32)AVM_BMP_W - 1) >> 1;
-
-				word = ((const u32 *)bmp)[y0 * (AVM_BMP_W / 2)
-							  + mx];
-			}
-			cb = (word >> 8) & 0xFF;
-			cr = (word >> 24) & 0xFF;
-			drow[m] = (ys[0] & 0xFF) | (cb << 8) |
-				  ((ys[1] & 0xFF) << 16) | (cr << 24);
-		}
+		memcpy(drow, srow, (dw / 2) * sizeof(u32));
 	}
 
 	dev->splash_w = w;
@@ -360,7 +312,8 @@ static void avm_splash_tick(struct avm_device *dev)
 	struct avm_parser *p = &dev->parser;
 	struct avm_signal sig;
 	enum avm_splash kind;
-	u32 w, h;
+	u32 live_w, live_h, target_w, target_h;
+	u32 req_w, req_h;
 	unsigned long flags;
 	ktime_t idle;
 
@@ -369,9 +322,22 @@ static void avm_splash_tick(struct avm_device *dev)
 		return;
 	}
 
-	avm_live_geometry(dev, &w, &h);
+	avm_live_geometry(dev, &live_w, &live_h);
+	req_w = READ_ONCE(dev->req_w);
+	req_h = READ_ONCE(dev->req_h);
 
-	if (avm_req_mismatch(dev, w, h)) {
+	/* Target geometry: the buffer size allocated by the consumer (OBS)
+	 * matches dev->req_w x dev->req_h if a specific resolution was
+	 * negotiated, else the live source geometry. */
+	if (req_w && req_h) {
+		target_w = req_w;
+		target_h = req_h;
+	} else {
+		target_w = live_w;
+		target_h = live_h;
+	}
+
+	if (avm_req_mismatch(dev, live_w, live_h)) {
 		/*
 		 * The consumer negotiated a geometry the source cannot
 		 * provide.  The vendor shows "signal out of range" here, and
@@ -406,15 +372,15 @@ static void avm_splash_tick(struct avm_device *dev)
 	if (kind != dev->splash_cached)
 		avm_splash_expand(dev, kind);
 
-	if (kind != dev->splash || w != dev->splash_w || h != dev->splash_h) {
-		if (!avm_splash_compose(dev, kind, w, h))
+	if (kind != dev->splash || target_w != dev->splash_w || target_h != dev->splash_h) {
+		if (!avm_splash_compose(dev, kind, target_w, target_h))
 			return;
 	}
 	if (kind != dev->splash) {
 		dev_info(&dev->udev->dev, "no video: showing %s overlay %ux%u\n",
 			 kind == AVM_SPLASH_NO_SIGNAL ? "no-signal"
 						      : "out-of-range",
-			 w, h);
+			 target_w, target_h);
 		dev->splash = kind;
 	}
 

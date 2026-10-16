@@ -240,6 +240,7 @@ void avm_parser_reset(struct avm_device *dev)
 	p->in_audio = false;
 	p->in_audio_padding = false;
 	p->clock_recovering = false;
+	p->consecutive_valid = 0;
 	p->remaining_audio_words = 0;
 	p->frame_words = 0;
 	p->have_seq = false;
@@ -439,6 +440,7 @@ static void avm_weave_field(struct avm_device *dev, u32 field_words)
 		p->fields_woven = 0;
 		/* keep only the (already interleaved) half-height pair */
 		avm_note_frame(p);
+		WRITE_ONCE(p->consecutive_valid, READ_ONCE(p->consecutive_valid) + 1);
 		avm_deliver_frame(dev, p->weave, frame_words);
 	}
 }
@@ -497,10 +499,27 @@ static void avm_handle_frame_end(struct avm_device *dev, u32 frame_words)
 	 * interlace source; the status worker's STDI bit is the fallback. */
 	bool interlaced;
 	u32 present;
+	unsigned long flags;
+	bool sig_valid, tmds_locked;
 
 	if (!frame_words) {
 		p->fields_woven = 0;
 		atomic_inc(&p->dropped_frames);
+		WRITE_ONCE(p->consecutive_valid, 0);
+		return;
+	}
+
+	spin_lock_irqsave(&dev->sig_lock, flags);
+	sig_valid = dev->sig.valid;
+	tmds_locked = dev->sig.tmds_locked;
+	spin_unlock_irqrestore(&dev->sig_lock, flags);
+
+	if (sig_valid && !tmds_locked) {
+		/* TMDS unlocked: free-run or bus noise, not real video.
+		 * Drop and do not refresh last_real_kt so the standby overlay shows. */
+		p->fields_woven = 0;
+		atomic_inc(&p->dropped_frames);
+		WRITE_ONCE(p->consecutive_valid, 0);
 		return;
 	}
 
@@ -510,6 +529,7 @@ static void avm_handle_frame_end(struct avm_device *dev, u32 frame_words)
 		p->fields_woven = 0;
 		atomic_inc(&p->corrupt_frames);
 		atomic_inc(&p->dropped_frames);
+		WRITE_ONCE(p->consecutive_valid, 0);
 		return;
 	}
 
@@ -517,6 +537,21 @@ static void avm_handle_frame_end(struct avm_device *dev, u32 frame_words)
 	 * stamp (diagnostic; a dying input stops updating it, transitional
 	 * drops still count as live data). */
 	WRITE_ONCE(p->last_real_kt, ktime_get());
+	WRITE_ONCE(p->clock_recovering, false);
+
+	/*
+	 * Windows driver parity: when 24 fps is requested from a >30 fps source
+	 * (e.g. 1080p60), the hardware converter has no 24 fps table and the
+	 * Windows driver drops into a black screen ("at 24fps it will completely
+	 * stop working juist black screen, simple fix js turn the fps back up").
+	 * Refreshing last_real_kt above keeps the "No Signal" overlay from firing,
+	 * while dropping the frame here produces the exact black screen.
+	 */
+	if (READ_ONCE(dev->cvx_req_fps) == 24 && READ_ONCE(p->measured_fps) > 30) {
+		p->fields_woven = 0;
+		atomic_inc(&p->dropped_frames);
+		return;
+	}
 
 	/* Mode switch hysteresis: 4 consecutive same-geometry frames. */
 	if (READ_ONCE(p->active_w) == mode->w &&
@@ -572,6 +607,7 @@ static void avm_handle_frame_end(struct avm_device *dev, u32 frame_words)
 		p->fields_woven = 0;
 		atomic_inc(&p->corrupt_frames);
 		atomic_inc(&p->dropped_frames);
+		WRITE_ONCE(p->consecutive_valid, 0);
 		return;
 	}
 
@@ -582,6 +618,7 @@ static void avm_handle_frame_end(struct avm_device *dev, u32 frame_words)
 
 	p->fields_woven = 0;
 	avm_note_frame(p);
+	WRITE_ONCE(p->consecutive_valid, READ_ONCE(p->consecutive_valid) + 1);
 	avm_deliver_frame(dev, p->frame, present);
 }
 
@@ -690,8 +727,10 @@ void avm_parser_feed(struct avm_device *dev, u32 *d, u32 count)
 			b3 = (meta >> 24) & 0xFF;
 			chk = (b0 + b1 + b2 - 0x40) & 0xFF;
 			if (b1 == 0x01 && chk == b3) {
-				if (p->have_seq && b0 != avm_next_seq(p->last_seq))
+				if (p->have_seq && b0 != avm_next_seq(p->last_seq)) {
 					atomic_inc(&p->resync_count);
+					WRITE_ONCE(p->consecutive_valid, 0);
+				}
 				p->last_seq = (u8)b0;
 				p->have_seq = true;
 				p->field_flags = (u32)b2;
@@ -699,6 +738,7 @@ void avm_parser_feed(struct avm_device *dev, u32 *d, u32 count)
 					/* prior frame never reached C1 */
 					atomic_inc(&p->dropped_frames);
 					p->fields_woven = 0;
+					WRITE_ONCE(p->consecutive_valid, 0);
 				}
 				p->frame_words = 0;
 				p->in_video = true;
@@ -709,6 +749,7 @@ void avm_parser_feed(struct avm_device *dev, u32 *d, u32 count)
 			}
 			/* Invalid C0: cannot trust this boundary; drop partial frame */
 			atomic_inc(&p->corrupt_frames);
+			WRITE_ONCE(p->consecutive_valid, 0);
 			p->frame_words = 0;
 			p->in_video = false;
 			p->fields_woven = 0;
@@ -740,6 +781,8 @@ void avm_parser_feed(struct avm_device *dev, u32 *d, u32 count)
 			/* FPGA HDMI clock/PLL recovering flag (tb2 bit 4): drop. */
 			if (trailer_valid && (tb2 & 0x10)) {
 				atomic_inc(&p->dropped_frames);
+				WRITE_ONCE(p->clock_recovering, true);
+				WRITE_ONCE(p->consecutive_valid, 0);
 				p->frame_words = 0;
 				p->in_video = false;
 				p->fields_woven = 0;
@@ -754,6 +797,7 @@ void avm_parser_feed(struct avm_device *dev, u32 *d, u32 count)
 					/* lone / bad-trailer C1: end frame, discard it */
 					atomic_inc(&p->corrupt_frames);
 					atomic_inc(&p->dropped_frames);
+					WRITE_ONCE(p->consecutive_valid, 0);
 				}
 				p->fields_woven = 0;
 			}

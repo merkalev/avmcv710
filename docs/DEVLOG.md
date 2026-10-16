@@ -58,7 +58,7 @@ Built, awaiting user install/test:
 | Res/fps change without restart | yes | yes (V4L2_EVENT_SOURCE_CHANGE) | ✅ |
 | "Video Input Frame Rate" 60/50/30/25 | CVX8897 | CVX8897, opt-in; menu = {native, native/2} only | ✅ |
 | Audio S16LE stereo @ 32/44.1/48 kHz | yes (PCM) | ALSA capture PCM (`avmcv710-audio.c`), opt-in `avm_audio=1` | ✅ (test pending, opt-in) |
-| No-signal overlay | yes (BMP splice) | 640x480 BMP composited at live geometry, RLE-stored (2026-10-16) | ✅ (test pending) |
+| No-signal overlay | yes (BMP splice) | 640x480 BMP (macOS rendition) composited at live geometry, RLE-stored (2026-10-16) | ✅ (test pending) |
 | Out-of-range overlay | yes | receiver-driven **and** non-native S_FMT request (`avm_req_mismatch`), 2026-10-16 | ✅ (test pending) |
 | Content-protection overlay | yes | compiled in (`aver_custom_content_protection.bmp`); trigger not wired (HDCP doc only) | 🟡 doc |
 | Receiver status (lock/RGB/rate) | ~10 Hz poll | 1 Hz poll while streaming → `dev->sig` | ✅ (test pending) |
@@ -326,12 +326,23 @@ does keep four 640x480 standby bitmaps in the installer
 (`driver_extracted/win/aver_custom_{no_signal,out_of_range,hdcp_protection,
 content_protection}.bmp`), so the overlays come back - without the bloat.
 
-Data (`tools/gen_bmp.py` rewritten):
-- Converts each BMP to the FPGA's YUY2 raster, exactly as before, but stores
-  it **run-length encoded** as `(u32 word, u16 count)` pairs.  The images are
-  mostly flat limited-range black around a centred dialog box, so RLE shrinks
-  the generated `avmcv710-bmp.h` ~7x (14.8 MB -> 1.4 MB) and the compiled
-  `.rodata` ~3x (2.4 MB -> 0.74 MB, +0.76 MB to the `.ko`).
+Data (`tools/gen_bmp.py`):
+- **Source = the macOS rendition**: `cv710userspace/assets/aver_custom_*.bmp`
+  (the macOS RECentral presentation — the AVerMedia logo is composited into a
+  tighter dialog), not the Windows installer's `driver_extracted/win/` copy.
+  Both are 640x480x24 and vendor-produced; the macOS one is the branded
+  presentation and it lives in-tree, so the build no longer depends on the
+  extracted installer.  The Windows rendition is still one argument away
+  (`python3 tools/gen_bmp.py /path/to/driver_extracted/win`).  It is also
+  *cleaner*: a flat panel instead of a dithered gradient, so it RLEs to
+  43 316 runs / 663 KB versus 92 174 runs / 1.41 MB for the Windows copy.
+- Converts each BMP to the FPGA's YUY2 raster as before, but stores it
+  **run-length encoded** as `(u32 word, u16 count)` pairs.  Versus the raw
+  arrays removed 2026-10-15 (14.8 MB header, 2.4 MB `.rodata`) the RLE header
+  is 0.66 MB and the `.ko` grew by only ~0.55 MB (3.23 MB total, down from
+  3.62 MB with the Windows data).  (Note: `srcversion` is derived from the
+  kernel sources, not the generated header, so a bitmap-only change does not
+  perturb it — verify visually.)
 - `avm_splash_expand()` decodes the RLE into a per-device 640x480 sprite once
   per kind; `avm_splash_compose()` blits it centred on a limited-range black
   raster at the live geometry (cached by kind + geometry).

@@ -9,23 +9,35 @@ encrypted.  This tool converts them to the YUY2 raster the FPGA delivers
 driver can blit them with the same behavior: show the overlay instead of a
 frozen or black frame.
 
+Source of the bitmaps
+---------------------
+Two renditions of the same four overlays exist in the tree:
+
+  * cv710userspace/assets/  - the macOS RECentral rendition (the AVerMedia
+    logo is composited into the panel; a tighter dialog).  This is the
+    default, because the vendor's macOS presentation is the branded one and
+    it lives in-tree (no dependency on the extracted installer).
+  * driver_extracted/win/   - the Windows installer's copy: the same text in
+    a wider, logo-less panel.
+
+Both are 640x480x24 and were produced by the vendor; either can be built in
+by passing the directory as the first argument:
+    python3 tools/gen_bmp.py driver_extracted/win   # Windows rendition
+
 The raster is stored **run-length encoded** (word, count pairs) rather than
 raw: the images are mostly flat limited-range black around a centred dialog
 box, so RLE shrinks the generated header ~7x (14.8 MB -> ~2.2 MB) and the
 compiled .rodata ~3x (2.4 MB -> 0.74 MB).  The driver expands it once into a
 small sprite buffer (avmcv710-status.c, avm_splash_expand()).
 
-Inputs (found in the extracted vendor installer, driver_extracted/win/):
+Inputs, in the chosen directory:
     aver_custom_no_signal.bmp
     aver_custom_out_of_range.bmp
     aver_custom_hdcp_protection.bmp
     aver_custom_content_protection.bmp
 
 Usage:
-    python3 tools/gen_bmp.py [drvdir] [outfile]
-
-The bitmaps originate from the vendor driver package; keep this file and
-the cross-repo path in sync if the assets move.
+    python3 tools/gen_bmp.py [srcdir] [outfile]
 """
 
 import os
@@ -34,6 +46,11 @@ import sys
 
 W = 640
 H = 480
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+# cv710userspace/assets is the macOS rendition (see the module docstring).
+DEFAULT_SRC = os.path.normpath(
+    os.path.join(HERE, "..", "..", "cv710userspace", "assets"))
 
 SRC = {
     "no_signal": "aver_custom_no_signal.bmp",
@@ -118,8 +135,7 @@ def emit_rle(lines, name, runs):
 
 
 def main():
-    drvdir = sys.argv[1] if len(sys.argv) > 1 else (
-        "/home/hp/Projects/Piecap/driver_extracted/win")
+    drvdir = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_SRC
     outfile = sys.argv[2] if len(sys.argv) > 2 else (
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
                      "avmcv710-bmp.h"))

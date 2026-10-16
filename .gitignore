@@ -16,3 +16,6 @@ modules.order
 avmcv710-bmp.h
 # generated CVX8897 tables (tools/gen_cvx8897.py)
 avmcv710-cvx8897.h
+# python bytecode from the tools/
+__pycache__/
+*.pyc

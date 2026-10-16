@@ -239,7 +239,9 @@ Decision tree (implement based ONLY on the result):
   `dev->sig` before the first frame locks, then 1920x1080.
 - **Overlays (TODO-3, RESTORED 2026-10-16):** the status worker composites one
   of the vendor's four 640x480 bitmaps (RLE-decoded from `avmcv710-bmp.h` at
-  the live geometry) and delivers it through `avm_deliver_frame()` when the
+  the live geometry; the file is generated from the **macOS** rendition in
+  `cv710userspace/assets/` — see `tools/gen_bmp.py`) and delivers it through
+  `avm_deliver_frame()` when the
   stream has been idle > 250 ms (TMDS unlocked → no-signal; locked but out of
   range → out-of-range) **and** when a consumer negotiated a non-native
   geometry the FPGA cannot scale to (`avm_req_mismatch`; the parser drops live

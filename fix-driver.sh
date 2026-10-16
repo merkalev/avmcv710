@@ -24,7 +24,7 @@ set -u
 
 MOD="avmcv710"
 DRV="/sys/bus/usb/drivers/$MOD"
-EXPECTED_SRC="A15744791304F510C99C86E"   # 2026-10-16 OBS fps/res parity, 1:1 centered BMPs, anti-pop/drift
+EXPECTED_SRC="DE9D17942810A25B0C050D8"   # 2026-10-16 fix No-Signal Out-of-Range priority & resolution mismatch gating
 
 [ "$(id -u)" -eq 0 ] || { echo "run as root (sudo ./fix-driver.sh)"; exit 1; }
 

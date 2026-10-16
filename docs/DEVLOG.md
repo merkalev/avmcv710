@@ -1033,3 +1033,25 @@ ship; C877 is the CV710.)
    - Added `AVM_AUDIO_BUFFER_MIN = 32768` constraint and increased `AVM_AUDIO_PERIOD_MIN = 4096`.
    - Ring buffer is now guaranteed to be >= 4x the maximum FX3 audio packet size (8192 bytes), preventing `bytes > size` packet truncation and sample-drop latency drift.
    - `avm_audio_pcm_prepare()` resets `a->base = 0` so capture always begins frame-aligned.
+
+### 2026-10-16 (night) — Investigation of Official Drivers & Resolution Mismatch Gating
+
+1. **Official Driver Architecture Analysis (`driver_extracted/`):**
+   - **Lattice ECP3 Hardware Scaler:** `avmu3c877_x64.inf` specifies `ENABLE_SCALER = 1`, `SCALER_OP_MODE = 2`, `UserEnableScaler = 0`. By default, hardware FPGA scaling is disabled (`UserEnableScaler = 0`).
+   - **EP1 Scaler Control:** In `libC877Driver.dylib`, `CLFE3::setEnableFPGAScaler(enable)` sends EP1 vendor command `[0x22, enable]`. When bypassed, the FPGA passes the raw ADV7604 raster straight to the FX3 USB FIFO without scaling.
+   - **Buffer Size Enforcement:** In `VideoParseBuffer::copyData()` (`libC877Driver.dylib`), the vendor driver explicitly compares bytes received against the pin's allocated buffer size. Incomplete or mismatching frames are dropped (`Copy Data Drop Incomplete Frame buffersize %ld total %ld diff = %ld`), and the driver paints `aver_custom_out_of_range.bmp` 1:1 centered on the pin's buffer canvas.
+   - **Pin Definitions:** Both Windows (`avmu3_x64.sys`) and macOS (`libC877Driver.dylib` table `_g_AV877SupportResolution`) define discrete formats for 1080p, 720p, 576p, 480p, and 640x480. On Windows, DirectShow pins negotiate a fixed format at connect time; a mismatching input generates "Signal Out of Range" at the pin's geometry.
+
+2. **Fix: False "Signal Out of Range" When No Signal:**
+   - **Root Cause:** In `avmcv710-status.c`, `avm_splash_tick()` checked `if (avm_req_mismatch(dev, live_w, live_h))` before checking signal validity and TMDS lock. When no signal was connected, `live_w` defaulted to 1920x1080. If OBS was configured for 720p or 480p, `req_w != live_w` (1280 != 1920) immediately triggered `AVM_SPLASH_OUT_OF_RANGE`.
+   - **Fix:** Inverted priority in `avm_splash_tick()`. `if (!sig.valid || !sig.tmds_locked)` is now evaluated first: a disconnected cable or unlocked TMDS unconditionally displays `AVM_SPLASH_NO_SIGNAL` at the negotiated OBS buffer geometry, regardless of what resolution OBS requested.
+
+3. **Fix: Sub-1080p Source Switching Glitch ("Leave Unchanged" / Device Default):**
+   - **Root Cause:** In `avm_s_fmt()`, `dev->req_w` and `dev->req_h` were previously cleared to 0 when `f->fmt.pix.width == live_w`. When OBS started on a 1080p source, OBS allocated 1920x1080 buffers (4,147,200 bytes, stride 3840). When the HDMI source switched to 576p (720x576) or 480p (720x480), `avm_req_mismatch()` returned false (due to `rw == 0`). The parser shoved raw 576p frames (829,440 bytes, stride 1440) directly into the 1920x1080 buffer, causing severe stride/pitch shearing and diagonal tearing in OBS. Additionally, `avm_splash_tick()` fell back to composing a 720x576 splash into the 1920x1080 buffer, causing the capture pipeline to choke.
+   - **Fix:**
+     - In `avm_s_fmt()`, `dev->req_w` and `dev->req_h` are now strictly locked to `f->fmt.pix.width` and `f->fmt.pix.height`.
+     - In `avm_video_register()`, `dev->req_w` and `dev->req_h` are initialized to 1920x1080 matching `dev->fmt`.
+     - In `avmcv710-parser.c`, incoming frames that do not match the negotiated buffer geometry are dropped safely, preventing buffer memory corruption.
+     - In `avmcv710-status.c`, target geometry always aligns with `dev->req_w x dev->req_h` or `dev->fmt`, compositing a pixel-perfect 1:1 centered "Signal Out of Range" overlay at the consumer's buffer size.
+     - In `avm_g_fmt()`, when `vb2_is_busy()` (streaming is active), `dev->fmt` is returned without mutation, preventing in-stream geometry desync.
+     - When the user selects 720x576 in OBS, `s_fmt` reallocates 720x576 buffers and 576p streams natively and flawlessly.

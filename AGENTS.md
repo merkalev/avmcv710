@@ -324,7 +324,7 @@ Decision tree (implement based ONLY on the result):
 | — | Standalone ALSA audio capture | ✅ Refcounted pipeline in `avm_pipeline_start`/`stop`; `arecord` runs standalone without video player active |
 
 Current module identity (for regression diffing): `srcversion
-A15744791304F510C99C86E` (2026-10-16 OBS fps/res parity, 1:1 centered BMPs, anti-pop/drift
+DE9D17942810A25B0C050D8` (2026-10-16 fix No-Signal Out-of-Range priority & resolution mismatch buffer gating
 — see `docs/DEVLOG.md`), parms `cvx8897`, `avm_audio`
 (bool, default on), `avm_audio_index`, `avm_audio_id`, `auto_reset`
 (bool, default off), `softdep: pre: snd-pcm`, 4×2 MB URBs.  `fix-driver.sh`

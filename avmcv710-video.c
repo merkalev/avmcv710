@@ -79,28 +79,30 @@ static int avm_enum_fmt(struct file *file, void *fh,
  * parser fallback and the format negotiation agree. */
 void avm_live_geometry(struct avm_device *dev, u32 *w, u32 *h)
 {
-	u32 ww = READ_ONCE(dev->parser.active_w);
-	u32 hh = READ_ONCE(dev->parser.active_h);
+	u32 ww = 0, hh = 0;
 	bool interlaced = false;
 	unsigned long flags;
 
+	spin_lock_irqsave(&dev->sig_lock, flags);
+	if (dev->sig.valid && dev->sig.tmds_locked &&
+	    dev->sig.w >= 320 && dev->sig.w <= 4095 &&
+	    (dev->sig.w & 1) == 0 &&
+	    dev->sig.h >= 120 && dev->sig.h <= 2048) {
+		ww = dev->sig.w;
+		hh = dev->sig.h;
+		interlaced = dev->sig.interlaced;
+	}
+	spin_unlock_irqrestore(&dev->sig_lock, flags);
+	if (interlaced && hh <= 700)
+		hh *= 2;
+	if ((u64)ww * hh / 2 > AVM_MAX_FRAME_WORDS) {
+		ww = 0;
+		hh = 0;
+	}
+
 	if (!ww || !hh) {
-		spin_lock_irqsave(&dev->sig_lock, flags);
-		if (dev->sig.valid && dev->sig.tmds_locked &&
-		    dev->sig.w >= 320 && dev->sig.w <= 4095 &&
-		    (dev->sig.w & 1) == 0 &&
-		    dev->sig.h >= 120 && dev->sig.h <= 2048) {
-			ww = dev->sig.w;
-			hh = dev->sig.h;
-			interlaced = dev->sig.interlaced;
-		}
-		spin_unlock_irqrestore(&dev->sig_lock, flags);
-		if (interlaced && hh <= 700)
-			hh *= 2;
-		if ((u64)ww * hh / 2 > AVM_MAX_FRAME_WORDS) {
-			ww = 0;
-			hh = 0;
-		}
+		ww = READ_ONCE(dev->parser.active_w);
+		hh = READ_ONCE(dev->parser.active_h);
 	}
 	if (!ww || !hh) {
 		ww = 1920;
@@ -175,6 +177,12 @@ static int avm_g_fmt(struct file *file, void *fh, struct v4l2_format *f)
 
 	if (f->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 		return -EINVAL;
+
+	if (vb2_is_busy(&dev->q)) {
+		f->fmt.pix = dev->fmt;
+		return 0;
+	}
+
 	avm_pixfmt(dev, &f->fmt.pix);
 	dev->fmt = f->fmt.pix;
 	return 0;
@@ -267,7 +275,6 @@ static int avm_try_fmt(struct file *file, void *fh, struct v4l2_format *f)
 static int avm_s_fmt(struct file *file, void *fh, struct v4l2_format *f)
 {
 	struct avm_device *dev = video_drvdata(file);
-	u32 live_w, live_h;
 	int ret;
 
 	if (f->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
@@ -280,22 +287,15 @@ static int avm_s_fmt(struct file *file, void *fh, struct v4l2_format *f)
 		return ret;
 	dev->fmt = f->fmt.pix;
 
-	avm_live_geometry(dev, &live_w, &live_h);
-
 	/*
-	 * If the consumer negotiated a geometry different from the live HDMI
-	 * source, record req_w/req_h so the standby overlay pump delivers
-	 * the official "signal out of range" splash at that geometry.
-	 * If the consumer accepts the live source geometry (e.g. Device Default),
-	 * clear req_w/req_h to 0 so the capture pipe seamlessly tracks the source.
+	 * Record the consumer's negotiated geometry so the parser and standby
+	 * overlay pump strictly match the allocated buffer size. Any incoming
+	 * raster differing from the negotiated buffer format is gated out
+	 * (avm_req_mismatch()) and presents "Signal Out of Range" at the
+	 * negotiated buffer size, preventing stride corruption and tearing.
 	 */
-	if (f->fmt.pix.width != live_w || f->fmt.pix.height != live_h) {
-		WRITE_ONCE(dev->req_w, f->fmt.pix.width);
-		WRITE_ONCE(dev->req_h, f->fmt.pix.height);
-	} else {
-		WRITE_ONCE(dev->req_w, 0);
-		WRITE_ONCE(dev->req_h, 0);
-	}
+	WRITE_ONCE(dev->req_w, f->fmt.pix.width);
+	WRITE_ONCE(dev->req_h, f->fmt.pix.height);
 	return 0;
 }
 
@@ -837,6 +837,8 @@ int avm_video_register(struct avm_device *dev)
 	dev->fmt.ycbcr_enc = V4L2_YCBCR_ENC_709;
 	dev->fmt.quantization = V4L2_QUANTIZATION_LIM_RANGE;
 	dev->fmt.xfer_func = V4L2_XFER_FUNC_709;
+	dev->req_w = dev->fmt.width;
+	dev->req_h = dev->fmt.height;
 
 	ret = v4l2_device_register(&dev->udev->dev, v4l2_dev);
 	if (ret) {

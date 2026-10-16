@@ -326,30 +326,41 @@ static void avm_splash_tick(struct avm_device *dev)
 	req_w = READ_ONCE(dev->req_w);
 	req_h = READ_ONCE(dev->req_h);
 
-	/* Target geometry: the buffer size allocated by the consumer (OBS)
-	 * matches dev->req_w x dev->req_h if a specific resolution was
-	 * negotiated, else the live source geometry. */
+	/* Target geometry: MUST match the buffer size allocated by the consumer (OBS) */
 	if (req_w && req_h) {
 		target_w = req_w;
 		target_h = req_h;
+	} else if (dev->fmt.width && dev->fmt.height) {
+		target_w = dev->fmt.width;
+		target_h = dev->fmt.height;
 	} else {
 		target_w = live_w;
 		target_h = live_h;
 	}
 
-	if (avm_req_mismatch(dev, live_w, live_h)) {
+	spin_lock_irqsave(&dev->sig_lock, flags);
+	sig = dev->sig;
+	spin_unlock_irqrestore(&dev->sig_lock, flags);
+
+	/*
+	 * Signal and lock gating:
+	 * 1. Disconnected cable or unlocked TMDS is ALWAYS "No Signal",
+	 *    never "Signal Out of Range", regardless of requested geometry.
+	 */
+	if (!sig.valid || !sig.tmds_locked) {
+		kind = AVM_SPLASH_NO_SIGNAL;
+	} else if (avm_req_mismatch(dev, live_w, live_h)) {
 		/*
-		 * The consumer negotiated a geometry the source cannot
-		 * provide.  The vendor shows "signal out of range" here, and
-		 * the parser drops the live frames while the mismatch holds,
-		 * so no idle test applies.
+		 * HDMI signal is locked, but the consumer negotiated a geometry
+		 * the source is not providing. Show "Signal Out of Range" at the
+		 * consumer's negotiated buffer size.
 		 */
 		kind = AVM_SPLASH_OUT_OF_RANGE;
+	} else if (!avm_signal_ok(&sig)) {
+		/* Locked signal timing outside supported hardware boundaries */
+		kind = AVM_SPLASH_OUT_OF_RANGE;
 	} else {
-		spin_lock_irqsave(&dev->sig_lock, flags);
-		sig = dev->sig;
-		spin_unlock_irqrestore(&dev->sig_lock, flags);
-
+		/* Signal is locked and geometry matches: check stream liveness */
 		idle = ktime_sub(ktime_get(), READ_ONCE(p->last_real_kt));
 		if (ktime_to_ms(idle) < AVM_SPLASH_IDLE_MS) {
 			if (dev->splash != AVM_SPLASH_NONE) {
@@ -360,13 +371,8 @@ static void avm_splash_tick(struct avm_device *dev)
 			return;
 		}
 
-		/* Stream is silent: pick the overlay that matches. */
-		if (!sig.valid || !sig.tmds_locked)
-			kind = AVM_SPLASH_NO_SIGNAL;
-		else if (!avm_signal_ok(&sig))
-			kind = AVM_SPLASH_OUT_OF_RANGE;
-		else
-			kind = AVM_SPLASH_NO_SIGNAL;	/* locked but dark */
+		/* Locked and geometry matches, but frames stopped arriving (dark/idle) */
+		kind = AVM_SPLASH_NO_SIGNAL;
 	}
 
 	if (kind != dev->splash_cached)

@@ -15,6 +15,11 @@
 #   sudo ./fix-driver.sh                    # video-only module (default)
 #   sudo ./fix-driver.sh avm_audio=1        # with the ALSA capture card
 #
+# If the working tree has a build (./avmcv710.ko) whose srcversion differs from
+# the installed module, this script installs the tree build first, so running
+# it right after an edit always brings up the new code instead of silently
+# reloading the previous one.
+#
 set -u
 
 MOD="avmcv710"
@@ -24,6 +29,29 @@ EXPECTED_SRC="175B77B95E4CE52C6CF1E38"   # 2026-10-16 PARSER-PAD (short frames b
 [ "$(id -u)" -eq 0 ] || { echo "run as root (sudo ./fix-driver.sh)"; exit 1; }
 
 fail() { echo "FAIL: $*"; exit 1; }
+
+# --- 0. install the working tree's build if it is not what is loaded --------
+# modprobe loads whatever lives under /lib/modules, NOT this directory.  Right
+# after an edit + `make`, the tree has a fresh ./avmcv710.ko while the installed
+# module is still the previous build, so reloading without installing silently
+# brings back the OLD code (the classic "why didn't my fix take" trap).  Detect
+# the mismatch and install the tree build first.
+here="$(cd "$(dirname "$0")" && pwd)"
+if [ -f "$here/avmcv710.ko" ]; then
+	built_src="$(modinfo "$here/avmcv710.ko" 2>/dev/null | awk '/^srcversion/{print $2}')"
+	inst_src="$(modinfo "$MOD" 2>/dev/null | awk '/^srcversion/{print $2}')"
+	if [ -n "$built_src" ] && [ "$built_src" != "$inst_src" ]; then
+		echo "installed $MOD is ${inst_src:-none}; tree build is $built_src -> installing it"
+		make -C "$here" KDIR="/lib/modules/$(uname -r)/build" LLVM=1 install >/dev/null \
+			|| fail "make install failed"
+		depmod "$(uname -r)"
+		echo "installed fresh build ($built_src)"
+	else
+		echo "installed $MOD already matches the tree build (${inst_src:-none})"
+	fi
+else
+	echo "note: no ./avmcv710.ko in $here; reloading the installed module as-is"
+fi
 
 # --- 1. close OBS first, unconditionally ---------------------------------
 # OBS retries its capture source, so it can grab /dev/video0 in the gap

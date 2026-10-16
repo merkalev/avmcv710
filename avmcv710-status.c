@@ -179,16 +179,15 @@ static void avm_poll_signal(struct avm_device *dev)
 	 * Abort immediately if any core read fails (cv710userspace CV-13).
 	 * Never hammer the control endpoint when the FX3 is busy.
 	 */
-	if (avm_i2c_read_block(dev, 0x20, 0x6A, &io_lock, 1)) {
+	if (avm_i2c_read_block(dev, 0x20, 0x6A, &io_lock, 1) ||
+	    avm_i2c_read_block(dev, 0x20, 0x12, &io_flags, 1) ||
+	    avm_i2c_read_block(dev, 0x34, 0x07, wb, 2) ||
+	    avm_i2c_read_block(dev, 0x34, 0x09, hb, 2)) {
+		spin_lock_irqsave(&dev->sig_lock, flags);
 		dev->sig.poll_failures++;
+		spin_unlock_irqrestore(&dev->sig_lock, flags);
 		return;
 	}
-	dev->sig.poll_failures = 0;
-
-	if (avm_i2c_read_block(dev, 0x20, 0x12, &io_flags, 1) ||
-	    avm_i2c_read_block(dev, 0x34, 0x07, wb, 2) ||
-	    avm_i2c_read_block(dev, 0x34, 0x09, hb, 2))
-		return;
 
 	/* AVI colorspace (raw HDMI 0x53 low nibble) */
 	if (avm_i2c_read_block(dev, 0x34, 0x53, &cs, 1))
@@ -423,12 +422,22 @@ static void avm_status_work_fn(struct work_struct *work)
 {
 	struct avm_device *dev = container_of(work, struct avm_device,
 					      status_work.work);
-	u32 delay_ms = AVM_STATUS_PERIOD_MS;
+	unsigned long flags;
+	u32 failures, poll_every;
 
 	if (!READ_ONCE(dev->streaming))
 		return;
 
-	if ((dev->status_tick % AVM_POLL_EVERY) == 0)
+	spin_lock_irqsave(&dev->sig_lock, flags);
+	failures = dev->sig.poll_failures;
+	spin_unlock_irqrestore(&dev->sig_lock, flags);
+
+	/* Back off the I2C poll cadence (~1 Hz -> ~0.33 Hz) when EP1 fails
+	 * repeatedly, while keeping the 33 ms tick so the 10 Hz standby
+	 * overlay pump never stutters. */
+	poll_every = (failures >= 3) ? (AVM_POLL_EVERY * 3) : AVM_POLL_EVERY;
+
+	if ((dev->status_tick % poll_every) == 0)
 		avm_poll_signal(dev);
 
 	if ((dev->status_tick % AVM_SPLASH_EVERY) == 0)
@@ -436,13 +445,9 @@ static void avm_status_work_fn(struct work_struct *work)
 
 	dev->status_tick++;
 
-	/* If polling fails repeatedly (EP1 wedged), back off to 1 Hz. */
-	if (dev->sig.poll_failures >= 3)
-		delay_ms = 1000;
-
 	if (READ_ONCE(dev->streaming))
 		queue_delayed_work(system_dfl_wq, &dev->status_work,
-				   msecs_to_jiffies(delay_ms));
+				   msecs_to_jiffies(AVM_STATUS_PERIOD_MS));
 }
 
 int avm_status_init(struct avm_device *dev)

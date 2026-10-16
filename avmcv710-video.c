@@ -171,6 +171,7 @@ static int avm_g_fmt(struct file *file, void *fh, struct v4l2_format *f)
 	if (f->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 		return -EINVAL;
 	avm_pixfmt(dev, &f->fmt.pix);
+	dev->fmt = f->fmt.pix;
 	return 0;
 }
 
@@ -272,7 +273,7 @@ static int avm_enum_framesizes(struct file *file, void *fh,
 			       struct v4l2_frmsizeenum *fsize)
 {
 	struct avm_device *dev = video_drvdata(file);
-	u32 live_w, live_h;
+	u32 live_w, live_h, seen = 0, i;
 
 	if (fsize->pixel_format != V4L2_PIX_FMT_YUYV)
 		return -EINVAL;
@@ -287,13 +288,18 @@ static int avm_enum_framesizes(struct file *file, void *fh,
 		return 0;
 	}
 
-	if (fsize->index <= ARRAY_SIZE(avm_frame_sizes)) {
-		u32 idx = fsize->index - 1;
-
-		fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
-		fsize->discrete.width = avm_frame_sizes[idx].width;
-		fsize->discrete.height = avm_frame_sizes[idx].height;
-		return 0;
+	/* Skip any standard table entry that duplicates live_w x live_h */
+	for (i = 0; i < ARRAY_SIZE(avm_frame_sizes); i++) {
+		if (avm_frame_sizes[i].width == live_w &&
+		    avm_frame_sizes[i].height == live_h)
+			continue;
+		seen++;
+		if (seen == fsize->index) {
+			fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
+			fsize->discrete.width = avm_frame_sizes[i].width;
+			fsize->discrete.height = avm_frame_sizes[i].height;
+			return 0;
+		}
 	}
 	return -EINVAL;
 }
@@ -354,8 +360,11 @@ static int avm_enum_frameintervals(struct file *file, void *fh,
 		fiv->discrete.denominator = fps;
 		return 0;
 	case 1:
-		/* the half rate is real only with the hardware converter on */
-		if (!avm_cvx8897_enabled() || (fps % 2))
+		/* the half rate is real only with the hardware converter on
+		 * and when a CVX8897 table exists for the requested mode */
+		if (!avm_cvx8897_enabled() || (fps % 2) ||
+		    !avm_cvx8897_half_rate(fiv->width, fiv->height, fps, false,
+					   READ_ONCE(dev->parser.active_interlaced)))
 			return -EINVAL;
 		fiv->discrete.denominator = fps / 2;
 		return 0;
@@ -392,6 +401,50 @@ static int avm_s_parm(struct file *file, void *fh, struct v4l2_streamparm *p)
 			p->parm.capture.timeperframe.denominator /
 			p->parm.capture.timeperframe.numerator);
 	return avm_g_parm(file, fh, p);
+}
+
+static int avm_log_status(struct file *file, void *fh)
+{
+	struct avm_device *dev = video_drvdata(file);
+	struct avm_parser *p = &dev->parser;
+	struct avm_signal sig;
+	unsigned long flags;
+	u32 live_w, live_h;
+
+	spin_lock_irqsave(&dev->sig_lock, flags);
+	sig = dev->sig;
+	spin_unlock_irqrestore(&dev->sig_lock, flags);
+
+	avm_live_geometry(dev, &live_w, &live_h);
+
+	dev_info(&dev->udev->dev, "=== avmcv710 status ===\n");
+	dev_info(&dev->udev->dev,
+		 "  Stream: %s, live=%ux%u%s, req=%ux%u, fps=%u (native=%u)\n",
+		 READ_ONCE(dev->streaming) ? "ACTIVE" : "IDLE",
+		 live_w, live_h,
+		 READ_ONCE(p->active_interlaced) ? "i" : "p",
+		 READ_ONCE(dev->req_w), READ_ONCE(dev->req_h),
+		 READ_ONCE(p->measured_fps), avm_native_fps(dev));
+	dev_info(&dev->udev->dev,
+		 "  ADV7604: valid=%u tmds=%s %ux%u%s cs=0x%02x (%s) aud_lock=%u rate=%u Hz poll_err=%u\n",
+		 sig.valid, sig.tmds_locked ? "LOCKED" : "UNLOCKED",
+		 sig.w, sig.h, sig.interlaced ? "i" : "p",
+		 sig.colorspace, sig.rgb ? "RGB" : "YCbCr",
+		 sig.audio_locked, sig.audio_rate, sig.poll_failures);
+	dev_info(&dev->udev->dev,
+		 "  CVX8897: enabled=%s half_active=%u req_fps=%u\n",
+		 avm_cvx8897_enabled() ? "yes" : "no",
+		 READ_ONCE(dev->cvx_prog_half),
+		 READ_ONCE(dev->cvx_req_fps));
+	dev_info(&dev->udev->dev,
+		 "  Parser: valid=%d dropped=%d corrupt=%d padded=%d resync=%d chunks=%lld\n",
+		 atomic_read(&p->valid_frames),
+		 atomic_read(&p->dropped_frames),
+		 atomic_read(&p->corrupt_frames),
+		 atomic_read(&p->padded_frames),
+		 atomic_read(&p->resync_count),
+		 (long long)atomic64_read(&dev->urb_chunks));
+	return 0;
 }
 
 /*
@@ -465,6 +518,7 @@ static const struct v4l2_ioctl_ops avm_ioctl_ops = {
 	.vidioc_dqbuf		= vb2_ioctl_dqbuf,
 	.vidioc_streamon	= vb2_ioctl_streamon,
 	.vidioc_streamoff	= vb2_ioctl_streamoff,
+	.vidioc_log_status	= avm_log_status,
 	.vidioc_subscribe_event	= avm_subscribe_event,
 	.vidioc_unsubscribe_event = avm_unsubscribe_event,
 };

@@ -140,20 +140,21 @@ static const struct avm_mode *avm_detect_mode(struct avm_device *dev,
 			 * receiver's geometry, converted to field words -
 			 * same fallback as the userspace driver. */
 			if (sig.h > 0) {
-				u32 frame_h = (sig.h <= 700) ? sig.h * 2
-							     : sig.h;
-				u64 expected = (u64)sig.w * frame_h / 4;
+				u32 field_h = (sig.h <= 700) ? sig.h
+							     : (sig.h / 2);
+				u32 frame_h = field_h * 2;
+				u64 expected = (u64)sig.w * field_h / 2;
 				u64 tol = expected / 50 + 64;
 
 				if (words + tol >= expected &&
 				    words <= expected + tol) {
 					m->w = sig.w;
 					m->h = frame_h;
-					/* target = words: the tolerance window
-					 * accepted this C1, so gate exactly on
-					 * what arrived - expected would never
-					 * match a non-table timing. */
-					m->target = words;
+					/* target is the nominal field word
+					 * count so avm_reconcile_frame() pads
+					 * short fields and truncates overruns
+					 * to stride_words * field_lines. */
+					m->target = (u32)expected;
 					m->name = "meas-i";
 					m->interlaced = true;
 					return m;
@@ -166,11 +167,11 @@ static const struct avm_mode *avm_detect_mode(struct avm_device *dev,
 			if (words + tol >= expected && words <= expected + tol) {
 				m->w = sig.w;
 				m->h = sig.h;
-				/* target = words: same rationale as the
-				 * interlaced fallback - expected only matches
-				 * when the FPGA raster happens to agree with
-				 * the receiver measurement bit-for-bit. */
-				m->target = words;
+				/* target is the nominal frame word count
+				 * (w * h / 2) so avm_reconcile_frame() pads
+				 * short frames and truncates overruns to the
+				 * negotiated V4L2 sizeimage. */
+				m->target = (u32)expected;
 				m->name = "meas-p";
 				m->interlaced = false;
 				return m;
@@ -182,18 +183,26 @@ static const struct avm_mode *avm_detect_mode(struct avm_device *dev,
 		const struct avm_mode *m = &avm_modes[i];
 		u32 lo, hi;
 
-		switch (m->w) {
-		case 1920:
+		/* Resolution-switch desync guard (mirrors cv710userspace): if
+		 * a locked receiver reports a valid width that contradicts this
+		 * fallback mode (e.g. a 1920x480 partial frame of 460,800 words
+		 * matching 1280x720), reject the mismatching width. */
+		if (sig.valid && sig.tmds_locked && sig.w >= 320 &&
+		    sig.w != m->w)
+			continue;
+
+		switch (m->h) {
+		case 1080:
 			if (m->interlaced) { lo = 510000; hi = 524000; }
 			else               { lo = 1000000; hi = 1050000; }
 			break;
-		case 1280:
+		case 720:
 			if (words >= 440000 && words <= 480000)
 				return m;
 			if (words >= 526000 && words <= 545000)
 				return m;
 			continue;
-		case 720:
+		case 576:
 			if (m->interlaced) { lo =  98000; hi = 110000; }
 			else               { lo = 195000; hi = 220000; }
 			break;
@@ -230,6 +239,7 @@ void avm_parser_reset(struct avm_device *dev)
 	p->in_video = false;
 	p->in_audio = false;
 	p->in_audio_padding = false;
+	p->clock_recovering = false;
 	p->remaining_audio_words = 0;
 	p->frame_words = 0;
 	p->have_seq = false;
@@ -244,6 +254,8 @@ void avm_parser_reset(struct avm_device *dev)
 	p->pending_w = p->pending_h = p->pending_count = 0;
 	p->active_w = 0;
 	p->active_h = 0;
+	p->active_interlaced = false;
+	p->target_words = 0;
 	p->mode_serial = 0;
 	p->frame_sequence = 0;
 	/* stamp a fresh stream as live; the overlay pump (avmcv710-status.c)
@@ -369,8 +381,10 @@ static void avm_weave_field(struct avm_device *dev, u32 field_words)
 	bool odd_field;
 	u32 y;
 
-	if (!p->active_w || field_words > stride_words * field_lines)
+	if (!p->active_w || field_words > stride_words * field_lines) {
+		p->fields_woven = 0;
 		return; /* corrupt field; CV-23: drop, never blend shifted rows */
+	}
 
 	/*
 	 * K3: the woven frame is twice the field size, and every row is
@@ -379,6 +393,7 @@ static void avm_weave_field(struct avm_device *dev, u32 field_words)
 	 * interlaced geometry can overrun p->weave (AVM_FRAME_BPF).
 	 */
 	if (frame_words > AVM_MAX_FRAME_WORDS) {
+		p->fields_woven = 0;
 		atomic_inc(&p->corrupt_frames);
 		atomic_inc(&p->dropped_frames);
 		return; /* CV-23: drop, never overrun */
@@ -481,6 +496,7 @@ static void avm_handle_frame_end(struct avm_device *dev, u32 frame_words)
 	u32 present;
 
 	if (!frame_words) {
+		p->fields_woven = 0;
 		atomic_inc(&p->dropped_frames);
 		return;
 	}
@@ -488,6 +504,7 @@ static void avm_handle_frame_end(struct avm_device *dev, u32 frame_words)
 	interlaced = (p->field_flags & 0x80) != 0;
 	mode = avm_detect_mode(dev, frame_words, interlaced);
 	if (!mode) {
+		p->fields_woven = 0;
 		atomic_inc(&p->corrupt_frames);
 		atomic_inc(&p->dropped_frames);
 		return;
@@ -518,7 +535,9 @@ static void avm_handle_frame_end(struct avm_device *dev, u32 frame_words)
 			WRITE_ONCE(p->active_w, mode->w);
 			WRITE_ONCE(p->active_h, mode->h);
 			WRITE_ONCE(p->active_interlaced, mode->interlaced);
+			p->target_words = mode->target;
 			p->pending_count = 0;
+			p->fields_woven = 0;
 			WRITE_ONCE(p->mode_serial, READ_ONCE(p->mode_serial) + 1);
 			/* tell consumers to re-negotiate the format */
 			avm_source_change(dev);
@@ -528,6 +547,7 @@ static void avm_handle_frame_end(struct avm_device *dev, u32 frame_words)
 
 	/* If the mode is not locked yet this frame is transitional: drop. */
 	if (mode_w_changed) {
+		p->fields_woven = 0;
 		atomic_inc(&p->dropped_frames);
 		return;
 	}
@@ -538,6 +558,7 @@ static void avm_handle_frame_end(struct avm_device *dev, u32 frame_words)
 	 * overlay pump, avmcv710-status.c, owns the output in that state).
 	 */
 	if (avm_req_mismatch(dev, mode->w, mode->h)) {
+		p->fields_woven = 0;
 		atomic_inc(&p->dropped_frames);
 		return;
 	}
@@ -545,6 +566,7 @@ static void avm_handle_frame_end(struct avm_device *dev, u32 frame_words)
 	/* Interlaced word counts are FIELD words (half the frame height). */
 	present = avm_reconcile_frame(dev, mode, frame_words);
 	if (!present) {
+		p->fields_woven = 0;
 		atomic_inc(&p->corrupt_frames);
 		atomic_inc(&p->dropped_frames);
 		return;
@@ -555,6 +577,7 @@ static void avm_handle_frame_end(struct avm_device *dev, u32 frame_words)
 		return;
 	}
 
+	p->fields_woven = 0;
 	avm_note_frame(p);
 	avm_deliver_frame(dev, p->frame, present);
 }
@@ -723,14 +746,16 @@ void avm_parser_feed(struct avm_device *dev, u32 *d, u32 count)
 
 			if (trailer_valid && p->in_video && p->frame_words > 0) {
 				avm_handle_frame_end(dev, p->frame_words);
-			} else if (p->in_video && p->frame_words > 0) {
-				/* lone / bad-trailer C1: end frame, discard it */
-				atomic_inc(&p->corrupt_frames);
-				atomic_inc(&p->dropped_frames);
+			} else {
+				if (p->in_video && p->frame_words > 0) {
+					/* lone / bad-trailer C1: end frame, discard it */
+					atomic_inc(&p->corrupt_frames);
+					atomic_inc(&p->dropped_frames);
+				}
+				p->fields_woven = 0;
 			}
 			p->frame_words = 0;
 			p->in_video = false;
-			p->fields_woven = 0;
 
 			/* marker + trailer words */
 			i += 3;
@@ -775,7 +800,7 @@ void avm_parser_feed(struct avm_device *dev, u32 *d, u32 count)
 			}
 			/* Invalid header length: absorb as a video word if framing */
 			if (p->in_video && p->frame_words < AVM_MAX_FRAME_WORDS)
-				p->frame_words++;
+				((u32 *)p->frame)[p->frame_words++] = d[i];
 			i++;
 			continue;
 		}

@@ -24,7 +24,7 @@ set -u
 
 MOD="avmcv710"
 DRV="/sys/bus/usb/drivers/$MOD"
-EXPECTED_SRC="88A8461A0A19B27F5F0F8F9"   # 2026-10-16 usb: soft_unbind + stream-gated disconnect park
+EXPECTED_SRC="2BE42869561C74E5836379B"   # 2026-10-16 deep-scan fixes + VIDIOC_LOG_STATUS
 
 [ "$(id -u)" -eq 0 ] || { echo "run as root (sudo ./fix-driver.sh)"; exit 1; }
 

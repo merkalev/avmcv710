@@ -26,7 +26,11 @@ KDIR ?= $(shell if [ -d "/lib/modules/$$(uname -r)/build" ]; then echo "/lib/mod
 LLVM ?= $(shell grep -q '^CONFIG_CC_IS_CLANG=y' "$(KDIR)/.config" 2>/dev/null && echo 1)
 KBUILD_ARGS := $(if $(LLVM),LLVM=$(LLVM))
 
-.PHONY: modules clean install
+PKG_NAME := avmcv710
+PKG_VER  := 0.1.0
+DKMS_DIR := /usr/src/$(PKG_NAME)-$(PKG_VER)
+
+.PHONY: modules clean install dkms-install dkms-remove
 modules:
 	$(MAKE) -C $(KDIR) M=$(CURDIR) $(KBUILD_ARGS) modules
 
@@ -35,3 +39,15 @@ clean:
 
 install: modules
 	$(MAKE) -C $(KDIR) M=$(CURDIR) $(KBUILD_ARGS) modules_install
+
+dkms-install:
+	install -d $(DKMS_DIR)
+	install -m 0644 Makefile Kconfig dkms.conf *.c *.h $(DKMS_DIR)/
+	dkms remove -m $(PKG_NAME) -v $(PKG_VER) --all 2>/dev/null || true
+	dkms add -m $(PKG_NAME) -v $(PKG_VER)
+	dkms build -m $(PKG_NAME) -v $(PKG_VER)
+	dkms install -m $(PKG_NAME) -v $(PKG_VER) --force
+
+dkms-remove:
+	dkms remove -m $(PKG_NAME) -v $(PKG_VER) --all 2>/dev/null || true
+	rm -rf $(DKMS_DIR)

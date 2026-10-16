@@ -3,11 +3,17 @@
 
 The AVerMedia Windows/macOS drivers ship four 640x480x24 overlay bitmaps
 (no-signal, out-of-range, HDCP and content-protection) that they composite
-into the capture stream when the input is unavailable or encrypted.  This
-tool converts them to the YUY2 raster the FPGA delivers (640x480, 2 bytes
-per pixel, top-down) and emits a C header so the kernel driver can blit
-them with the exact same behavior: show the overlay instead of a frozen
-or black frame.
+into the capture stream when the input is unavailable, unsupported or
+encrypted.  This tool converts them to the YUY2 raster the FPGA delivers
+(640x480, 2 bytes per pixel, top-down) and emits a C header so the kernel
+driver can blit them with the same behavior: show the overlay instead of a
+frozen or black frame.
+
+The raster is stored **run-length encoded** (word, count pairs) rather than
+raw: the images are mostly flat limited-range black around a centred dialog
+box, so RLE shrinks the generated header ~7x (14.8 MB -> ~2.2 MB) and the
+compiled .rodata ~3x (2.4 MB -> 0.74 MB).  The driver expands it once into a
+small sprite buffer (avmcv710-status.c, avm_splash_expand()).
 
 Inputs (found in the extracted vendor installer, driver_extracted/win/):
     aver_custom_no_signal.bmp
@@ -30,11 +36,12 @@ W = 640
 H = 480
 
 SRC = {
-    "NO_SIGNAL": "aver_custom_no_signal.bmp",
-    "OUT_OF_RANGE": "aver_custom_out_of_range.bmp",
-    "HDCP": "aver_custom_hdcp_protection.bmp",
-    "CONTENT_PROTECTION": "aver_custom_content_protection.bmp",
+    "no_signal": "aver_custom_no_signal.bmp",
+    "out_of_range": "aver_custom_out_of_range.bmp",
+    "hdcp": "aver_custom_hdcp_protection.bmp",
+    "content_protection": "aver_custom_content_protection.bmp",
 }
+
 
 def load_bmp(path):
     d = open(path, "rb").read()
@@ -50,11 +57,11 @@ def load_bmp(path):
     rows = []
     for y in range(abs(h)):
         row = px[y * stride : y * stride + w * 3]
-        # BMP rows are bottom-up
         rows.append(row)
     if h > 0:
         rows.reverse()
     return rows
+
 
 def bgr_to_yuyv(rows):
     """BT.601 limited-range YUY2, top-down raster."""
@@ -80,13 +87,35 @@ def bgr_to_yuyv(rows):
             out += bytes((yuv[0], cb, yuv[1], cr))
     return bytes(out)
 
-def emit_array(lines, name, data):
-    lines.append(f"static const u8 {name}[{W * H * 2}] = {{")
-    for i in range(0, len(data), 16):
-        chunk = data[i : i + 16]
-        lines.append("	" + ", ".join(f"0x{b:02X}" for b in chunk) + ",")
+
+def rle_words(data):
+    """Run-length encode a YUY2 raster into (u32 word, u16 count) runs."""
+    runs = []
+    prev = None
+    n = 0
+    for i in range(0, len(data), 4):
+        w = int.from_bytes(data[i : i + 4], "little")
+        if w == prev and n < 0xFFFF:
+            n += 1
+        else:
+            if prev is not None:
+                runs.append((prev, n))
+            prev = w
+            n = 1
+    if prev is not None:
+        runs.append((prev, n))
+    return runs
+
+
+def emit_rle(lines, name, runs):
+    lines.append(f"static const u32 {name}[{len(runs) * 2}] = {{")
+    lines.append("\t/* value, count */")
+    for i in range(0, len(runs), 4):
+        chunk = runs[i : i + 4]
+        lines.append("\t" + " ".join(f"0x{v:08X}, {n}," for v, n in chunk))
     lines.append("};")
     lines.append("")
+
 
 def main():
     drvdir = sys.argv[1] if len(sys.argv) > 1 else (
@@ -100,10 +129,10 @@ def main():
     lines.append("/*")
     lines.append(" * avmcv710-bmp.h - generated file, do not edit.")
     lines.append(" *")
-    lines.append(" * YUY2 640x480 overlays converted from the vendor driver's")
-    lines.append(" * composer bitmaps by tools/gen_bmp.py.  Shown when the")
-    lines.append(" * input is absent, out of range or encrypted, matching the")
-    lines.append(" * behavior of the official Windows/macOS driver.")
+    lines.append(" * YUY2 640x480 overlays, run-length encoded, converted from the")
+    lines.append(" * vendor driver's composer bitmaps by tools/gen_bmp.py.  Shown")
+    lines.append(" * when the input is absent, out of range or encrypted, matching")
+    lines.append(" * the behavior of the official Windows/macOS driver.")
     lines.append(" */")
     lines.append("#ifndef AVM_CV710_BMP_H")
     lines.append("#define AVM_CV710_BMP_H")
@@ -113,23 +142,27 @@ def main():
     lines.append(f"#define AVM_BMP_WORDS\t\t({W}u * {H}u / 2u)")
     lines.append("")
 
-    total = 0
+    total_runs = 0
     for key, fname in SRC.items():
         rows = load_bmp(os.path.join(drvdir, fname))
         yuyv = bgr_to_yuyv(rows)
         if len(yuyv) != W * H * 2:
             raise SystemExit(f"{fname}: bad conversion size {len(yuyv)}")
-        total += len(yuyv)
-        # name them after the enum avm_splash values for a 1:1 mapping
-        emit_array(lines, f"avm_bmp_{key.lower()}", yuyv)
+        runs = rle_words(yuyv)
+        total_runs += len(runs)
+        lines.append(f"#define AVM_BMP_{key.upper()}_RUNS\t{len(runs)}u")
+        emit_rle(lines, f"avm_bmp_{key}_rle", runs)
 
-    lines.append(f"/* {total} bytes of overlay payload total */")
+    lines.append(f"/* {total_runs} runs total; decoded size "
+                 f"{len(SRC) * W * H * 2} bytes */")
     lines.append("#endif /* AVM_CV710_BMP_H */")
 
     os.makedirs(os.path.dirname(outfile), exist_ok=True)
     with open(outfile, "w") as f:
         f.write("\n".join(lines) + "\n")
-    print(f"wrote {outfile} ({len(yuyv)*len(SRC)} bytes of overlay data)")
+    print(f"wrote {outfile}: {total_runs} runs, "
+          f"{os.path.getsize(outfile)} bytes of header")
+
 
 if __name__ == "__main__":
     main()

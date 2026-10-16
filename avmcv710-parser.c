@@ -246,8 +246,8 @@ void avm_parser_reset(struct avm_device *dev)
 	p->active_h = 0;
 	p->mode_serial = 0;
 	p->frame_sequence = 0;
-	/* stamp a fresh stream as live; last_real_kt is diagnostic only since
-	 * the overlay pump was removed (2026-10-15) */
+	/* stamp a fresh stream as live; the overlay pump (avmcv710-status.c)
+	 * uses last_real_kt to tell "real video flowing" from "show a splash" */
 	p->last_real_kt = ktime_get();
 	p->fps_t0 = 0;
 	p->fps_cnt = 0;
@@ -528,6 +528,16 @@ static void avm_handle_frame_end(struct avm_device *dev, u32 frame_words)
 
 	/* If the mode is not locked yet this frame is transitional: drop. */
 	if (mode_w_changed) {
+		atomic_inc(&p->dropped_frames);
+		return;
+	}
+
+	/*
+	 * The FPGA cannot scale: if the consumer negotiated a geometry other
+	 * than the live raster, live frames cannot be delivered (the standby
+	 * overlay pump, avmcv710-status.c, owns the output in that state).
+	 */
+	if (avm_req_mismatch(dev, mode->w, mode->h)) {
 		atomic_inc(&p->dropped_frames);
 		return;
 	}

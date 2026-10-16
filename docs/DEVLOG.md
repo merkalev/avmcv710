@@ -17,8 +17,8 @@ available to the agent).  Kernel log: `journalctl -k -f`.
 Working and user-confirmed:
 - Capture at source geometry/rate; no latency/lag (4×2 MB URBs)
 - No freeze on OBS res/fps changes (`vb2_fop_release`)
-- Honest enumeration (one live size; measured interval, or the CVX8897 menu
-  when enabled)
+- Honest enumeration (live size first; FPS menu = {native, native/2}, half only
+  when the CVX8897 converter is enabled)
 - Frame rate conversion (CVX8897), opt-in via `cvx8897=1`
 - STREAMON no-data watchdog (soft-reload diagnosis)
 - `measured_fps` no longer reports 61 for a 60 Hz source
@@ -30,13 +30,15 @@ Built, awaiting user install/test:
   disabled by default (`avm_audio=0`).**
 - **Continuous inter-frame audio:** audio demux now captures packets arriving
   between C1 and C0.
-- ADV7604 status poll (TODO-2): 10 Hz while streaming, publishes `dev->sig`
+- ADV7604 status poll (TODO-2): 1 Hz while streaming, publishes `dev->sig`
   (TMDS lock / interlace / measured geometry / colorspace / RGB)
-- **removed 2026-10-15** — the no-signal / out-of-range overlays (TODO-3)
-  were deleted with the splash subsystem in the streamlined rewrite (see the
-  2026-10-15 entry).  The receiver is now telemetry-only; a bare V4L2 node no
-  longer synthesizes the vendor's host-side splash.  Tracked as a parity
-  regression in the matrix below if it is to be re-added.
+- Standby overlays (TODO-3, **restored 2026-10-16**): the four vendor
+  `aver_custom_*.bmp` bitmaps (no-signal / out-of-range / HDCP /
+  content-protection) are composited at the negotiated geometry and delivered
+  through the normal frame path when the input is absent, unsupported or
+  encrypted - and when a consumer negotiates a non-native geometry the FPGA
+  cannot scale to (the vendor's "Signal Out of Range" case).  Stored
+  run-length encoded by `tools/gen_bmp.py` (~7x smaller than the old header).
 - Full-range quantization auto-detection (prevents crushed blacks in OBS when
   HDMI 0x53 reports full range)
 - CVX8897 720p60 dedicated RGB half-rate table auto-selection via ADV7604 colorspace
@@ -56,10 +58,10 @@ Built, awaiting user install/test:
 | Res/fps change without restart | yes | yes (V4L2_EVENT_SOURCE_CHANGE) | ✅ |
 | "Video Input Frame Rate" 60/50/30/25 | CVX8897 | CVX8897, opt-in; menu = {native, native/2} only | ✅ |
 | Audio S16LE stereo @ 32/44.1/48 kHz | yes (PCM) | ALSA capture PCM (`avmcv710-audio.c`), opt-in `avm_audio=1` | ✅ (test pending, opt-in) |
-| No-signal overlay | yes (BMP splice) | **removed 2026-10-15** (was: 640×480 BMP composited at live geometry) | ❌ regression |
-| Out-of-range overlay | yes | **removed 2026-10-15** | ❌ regression |
-| Content-protection overlay | yes | removed 2026-10-15 (HDCP doc only) | 🟡 doc |
-| Receiver status (lock/RGB/rate) | ~10 Hz poll | 10 Hz poll while streaming → `dev->sig` | ✅ (test pending) |
+| No-signal overlay | yes (BMP splice) | 640x480 BMP composited at live geometry, RLE-stored (2026-10-16) | ✅ (test pending) |
+| Out-of-range overlay | yes | receiver-driven **and** non-native S_FMT request (`avm_req_mismatch`), 2026-10-16 | ✅ (test pending) |
+| Content-protection overlay | yes | compiled in (`aver_custom_content_protection.bmp`); trigger not wired (HDCP doc only) | 🟡 doc |
+| Receiver status (lock/RGB/rate) | ~10 Hz poll | 1 Hz poll while streaming → `dev->sig` | ✅ (test pending) |
 | Warm restart without replug | yes | watchdog diagnosis; opt-in `auto_reset=1` | 🟡 TODO-4 |
 | Clean unload (rmmod without replug) | n/a | unbind drops the ALSA pin in disconnect; rmmod succeeds | ✅ (fixed 2026-10-12) |
 | EDID upload / HPD handshake on start | yes (every open) | yes (in 871-cmd trace, 0x50 ×N) | ✅ |
@@ -269,6 +271,62 @@ vdev release), prints `/sys/module/avmcv710/refcnt` while retrying rmmod,
 and — when the old build's invisible stray ref survives — prints the
 deliberate `sudo rmmod -f avmcv710 && sudo modprobe avmcv710` escape hatch
 instead of failing silently.
+
+### 2026-10-16 — standby overlays restored (no-signal / out-of-range)
+
+TODO-3's splash subsystem was deleted on 2026-10-15 as "bloat" (a 14.8 MB
+generated header plus a 4.6 MB per-device heap buffer).  The user asked for
+"as close to the official macOS/Windows driver as possible", and the vendor
+does keep four 640x480 standby bitmaps in the installer
+(`driver_extracted/win/aver_custom_{no_signal,out_of_range,hdcp_protection,
+content_protection}.bmp`), so the overlays come back - without the bloat.
+
+Data (`tools/gen_bmp.py` rewritten):
+- Converts each BMP to the FPGA's YUY2 raster, exactly as before, but stores
+  it **run-length encoded** as `(u32 word, u16 count)` pairs.  The images are
+  mostly flat limited-range black around a centred dialog box, so RLE shrinks
+  the generated `avmcv710-bmp.h` ~7x (14.8 MB -> 1.4 MB) and the compiled
+  `.rodata` ~3x (2.4 MB -> 0.74 MB, +0.76 MB to the `.ko`).
+- `avm_splash_expand()` decodes the RLE into a per-device 640x480 sprite once
+  per kind; `avm_splash_compose()` blits it centred on a limited-range black
+  raster at the live geometry (cached by kind + geometry).
+
+Delivery (`avmcv710-status.c`):
+- The status work now ticks at ~30 Hz but keeps the gentle **1 Hz** ADV7604
+  poll (the EP1-wedge protection), and re-delivers a splash every 3rd tick
+  (~10 Hz) - enough to keep a static image flowing without memcpy-ing 4.6 MB
+  at 30 Hz.
+- An overlay is shown only after the stream has been idle for 250 ms
+  (`p->last_real_kt`, stamped by the parser on every recognizable frame), so
+  a mode re-lock or USB hiccup does not flash the splash; real video clears
+  it immediately.
+- Kind selection: TDMS unlocked -> `no-signal`; locked but geometry outside
+  the deliverable range -> `out-of-range`; locked but dark -> `no-signal`.
+- Delivery goes through the ordinary `avm_deliver_frame()`, so timestamp and
+  sequence are stamped the same way as live frames.
+
+Non-native geometry (`avm_req_mismatch`, `avmcv710-video.c`/`-parser.c`):
+- The FPGA cannot scale.  When a consumer negotiates a geometry other than
+  the source raster (the user's report: "any resolution other than 1080p60
+  says res not supported, there is a bmp for that"), `S_FMT` records the
+  un-honoured request and the driver shows the `out-of-range` overlay instead
+  of live frames - matching the official driver, which paints
+  `aver_custom_out_of_range.bmp` ("Signal Out of Range - Please adjust your
+  resolution to supported range") rather than scaling.
+- A `S_FMT` that was already the reported geometry is *not* a forced pick and
+  clears the mismatch, so a consumer that simply accepts the device format
+  (OBS's normal path, `ENUM_FRAMESIZES` index 0 = live) always sees live
+  video, including across source-geometry changes.
+- While the mismatch holds, `avm_handle_frame_end()` drops live frames (they
+  cannot be delivered at the negotiated size), so the overlay and live video
+  never interleave.
+
+Acceptance (user test):
+- Pull the HDMI cable during capture -> the `no-signal` bitmap appears at the
+  negotiated geometry within ~0.25-1 s; replug -> live video returns.
+- Set OBS to a resolution other than the source's -> "Signal Out of Range"
+  appears; set it back to the source resolution -> live video returns.
+- Normal 1080p60 capture is unchanged (no overlay, no extra log spam).
 
 ### 2026-10-16 — frame-interval menu now matches what the hardware can do
 
@@ -568,6 +626,16 @@ ship; C877 is the CV710.)
   and `avmu3_x64.sys` (many `add $0xc0` C0-checksum sites) parse C0/C1 in the
   kernel driver.  Our in-kernel state machine is the same layer as the vendor;
   the earlier "marker constants absent" note was a false lead.
+- [x] **RES-OVERLAY — non-native resolution → vendor's out-of-range splash.**
+  **DONE 2026-10-16.**  Reporting from the user: on Windows, selecting any
+  resolution other than the source's (e.g. 640×480 while the source is
+  1080p60) shows `aver_custom_out_of_range.bmp` ("Signal Out of Range — Please
+  adjust your resolution to supported range"), i.e. the vendor *refuses* rather
+  than scales.  `S_FMT` now records a request it could not honour and
+  `avm_req_mismatch()` drives the same overlay at the negotiated geometry (the
+  parser drops live frames while the mismatch holds); a `S_FMT` matching the
+  reported geometry clears it, so OBS's normal "accept the device format" path
+  is unaffected.  Pending user hardware test.
 - [ ] **BOOTSTRAP-PARITY — 871-command replay vs `CRXADV7604`/`CLFE3` init.**
   Diff our `avmcv710-bootstrap.h` trace against the vendor's
   `CRXADV7604::HardwareInit` / `ConfigureRx` / `ADIAPI_TvInit` and the
@@ -589,17 +657,17 @@ ship; C877 is the CV710.)
   parser fallback geometry, and interlace/`measured_fps` feed the converter.
   Acceptance: `journalctl -k` shows the ADV7604 lock, and pulling the HDMI
   cable logs the TMDS UNLOCKED line within ~1 s.
-- [ ] **TODO-3 overlays — REMOVED 2026-10-15.** The overlay/splash subsystem
+- [x] **TODO-3 overlays — RESTORED 2026-10-16.**  The overlay/splash subsystem
   (640×480 BITMAP composite delivered through `avm_deliver_frame()`, the
-  `avm_splash_bmp()` accessor, the `avm_splash` enum, and the generated
-  14.8 MB `avmcv710-bmp.h`) was deleted in the streamlined rewrite; the
-  receiver worker is now telemetry-only (1 Hz ADV7604 poll) and no longer
-  synthesizes a standby image.  The vendor draws its splash host-side, so a
-  bare V4L2 node has no equivalent; re-adding it (host-side renderer, or an
-  OBS-side standby in the consumer) is deferred and tracked in the parity
-  matrix as a regression.  The `aver_custom_{no_signal,out_of_range,hdcp,
-  content_protection}.bmp` files in `driver_extracted/win/` are the vendor
-  bitmaps if a faithful re-add is ever wanted.
+  `avm_splash_bmp()` accessor, the `avm_splash` enum and the generated
+  `avmcv710-bmp.h`) was deleted 2026-10-15 as "bloat" and brought back
+  compactly: `tools/gen_bmp.py` now stores the bitmaps **run-length encoded**
+  (14.8 MB header → 1.4 MB; `.rodata` 2.4 MB → 0.74 MB), the status worker
+  keeps its 1 Hz ADV7604 poll but pumps the composite at ~10 Hz once the
+  stream has been idle > 250 ms, and a non-native `S_FMT` (`avm_req_mismatch`)
+  shows the vendor's "Signal Out of Range" bitmap exactly like the official
+  driver.  Acceptance: cable pull → no-signal overlay; non-native OBS
+  resolution → out-of-range overlay; normal capture unchanged.
 - [x] Converter: read the ADV7604 AVI colorspace flag (HDMI 0x34 reg 0x53) so a 720p60 RGB source
   gets the vendor's dedicated RGB table instead of the YCbCr 4:2:2 table
   (interlace + input rate + colorspace are now polled/measured).
@@ -610,9 +678,9 @@ ship; C877 is the CV710.)
 
 ### P2 — polish
 
-- [ ] Overlay pump — **removed 2026-10-15** (see TODO-3 above); re-add only if
-  a host-side standby is wanted.  `driver_extracted/win/aver_custom_*.bmp`
-  are the vendor bitmaps.
+- [x] Overlay pump — **restored 2026-10-16** (see TODO-3 above); RLE-stored
+  bitmaps, ~10 Hz pump, `avm_req_mismatch` for the non-native case.
+  `driver_extracted/win/aver_custom_*.bmp` are the vendor bitmaps.
 - [x] Wire `SNDRV_PCM_INFO_RESUME`-safe suspend/resume for audio.
 - [ ] HDCP: keep documentation-only, but log the ADV7604 HDCP state read.
 
@@ -620,6 +688,8 @@ ship; C877 is the CV710.)
 
 - EDID patching / VID_STD auto-switch (receiver is input-capability passthrough).
 - FPGA scaler enable (vendor `ENABLE_SCALER=1` resizes; we keep the raster).
+  A non-native `S_FMT` is answered the way the official driver does — with the
+  out-of-range overlay, not with scaling (2026-10-16).
 
 ---
 

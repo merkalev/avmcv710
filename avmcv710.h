@@ -168,7 +168,7 @@ struct avm_parser {
 	atomic_t resync_count;
 };
 
-/* ADV7604 status snapshot, published by the status worker (~10 Hz). */
+/* ADV7604 status snapshot, published by the status worker (~1 Hz poll). */
 struct avm_signal {
 	bool valid;		/* at least one successful poll published */
 	bool tmds_locked;	/* IO 0x6a: (v & 0xE0) == 0xE0 && (v & 0x10) */
@@ -178,6 +178,25 @@ struct avm_signal {
 	u32 w, h;		/* measured active geometry (12-bit, 0 = n/a) */
 	u32 poll_failures;	/* consecutive failed polls */
 };
+
+/*
+ * Standby overlays.  The vendor driver composites one of four 640x480
+ * bitmaps (no-signal / out-of-range / HDCP / content-protection) into the
+ * capture stream when the input is unavailable, unsupported or encrypted;
+ * a bare V4L2 node has no renderer, so this driver synthesizes the same
+ * image as a captured frame at the negotiated geometry.  The bitmaps come
+ * from driver_extracted/win/aver_custom_*.bmp via tools/gen_bmp.py.
+ */
+enum avm_splash {
+	AVM_SPLASH_NONE = 0,
+	AVM_SPLASH_NO_SIGNAL,
+	AVM_SPLASH_OUT_OF_RANGE,
+	AVM_SPLASH_HDCP,
+	AVM_SPLASH_CONTENT_PROTECTION,
+};
+
+/* RLE source + decoded length for one overlay bitmap. */
+const u32 *avm_splash_bmp(enum avm_splash kind, u32 *runs);
 
 struct avm_buffer {
 	struct vb2_v4l2_buffer vb;	/* must be first */
@@ -193,6 +212,12 @@ struct avm_device {
 	struct vb2_queue q;
 
 	struct v4l2_pix_format fmt;	/* current negotiated format */
+
+	/* What the consumer last asked S_FMT for.  The FPGA cannot scale, so
+	 * when this differs from the live source geometry the device shows
+	 * the vendor's "signal out of range" overlay instead of live frames
+	 * (avm_req_mismatch()).  0/0 = follow the source. */
+	u32 req_w, req_h;
 
 	/* serializes EP1 control traffic (I2C reads/writes are
 	 * command+response pairs and must stay atomic) */
@@ -215,6 +240,16 @@ struct avm_device {
 	struct avm_signal sig;
 	struct delayed_work status_work;
 	bool status_inited;		/* work initialized (probe err-path guard) */
+	u32 status_tick;		/* tick counter for the poll/pump cadence */
+
+	/* Standby overlay pump (avmcv710-status.c). splash_frame holds the
+	 * composited overlay at the negotiated geometry; sprite holds the
+	 * decoded 640x480 bitmap for the current kind. */
+	enum avm_splash splash;		/* overlay currently shown */
+	enum avm_splash splash_cached;	/* bitmap decoded into sprite */
+	u8 *splash_frame;		/* AVM_FRAME_BPF composited overlay */
+	u8 *sprite;			/* AVM_BMP_WORDS*4 decoded bitmap */
+	u32 splash_w, splash_h, splash_words;
 
 	/* ALSA capture PCM (avmcv710-audio.c): the parser pushes 0x58 audio
 	 * payload bytes into the PCM DMA buffer.  NULL until probe registers
@@ -270,6 +305,7 @@ bool avm_cvx8897_enabled(void);
 int avm_video_register(struct avm_device *dev);
 void avm_source_change(struct avm_device *dev);
 void avm_live_geometry(struct avm_device *dev, u32 *w, u32 *h);
+bool avm_req_mismatch(struct avm_device *dev, u32 w, u32 h);
 
 /* avmcv710-status.c */
 int avm_status_init(struct avm_device *dev);

@@ -105,6 +105,22 @@ void avm_live_geometry(struct avm_device *dev, u32 *w, u32 *h)
 	*h = hh;
 }
 
+/*
+ * True when the consumer negotiated a capture geometry the source cannot
+ * provide.  The FPGA passes the raster through with no scaler, so the
+ * official driver rejects a non-native S_FMT by showing the "signal out of
+ * range" overlay; this driver does the same (avmcv710-status.c delivers the
+ * overlay, the parser drops the live frames while the mismatch holds).
+ * Called from the parser hot path, so it is a plain READ_ONCE comparison.
+ */
+bool avm_req_mismatch(struct avm_device *dev, u32 w, u32 h)
+{
+	u32 rw = READ_ONCE(dev->req_w);
+	u32 rh = READ_ONCE(dev->req_h);
+
+	return rw && rh && (rw != w || rh != h);
+}
+
 static void avm_pixfmt(struct avm_device *dev, struct v4l2_pix_format *pix)
 {
 	u32 w, h;
@@ -182,6 +198,7 @@ static int avm_try_fmt(struct file *file, void *fh, struct v4l2_format *f)
 static int avm_s_fmt(struct file *file, void *fh, struct v4l2_format *f)
 {
 	struct avm_device *dev = video_drvdata(file);
+	u32 req_w, req_h;
 	int ret;
 
 	if (f->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
@@ -189,10 +206,31 @@ static int avm_s_fmt(struct file *file, void *fh, struct v4l2_format *f)
 	if (vb2_is_busy(&dev->q))
 		return -EBUSY;
 
+	/*
+	 * Remember what the consumer asked for.  The FPGA cannot scale, so a
+	 * request S_FMT could not honour means "the consumer is forcing a
+	 * geometry the source cannot provide" - the vendor answers that with
+	 * the "signal out of range" overlay, and so do we (avm_req_mismatch()).
+	 * A request that was already the reported geometry is not a forced
+	 * pick and clears any stale mismatch, so a consumer that simply
+	 * accepts the device format (the common case) always sees live video
+	 * even after the source changes geometry.
+	 */
+	req_w = f->fmt.pix.width;
+	req_h = f->fmt.pix.height;
+
 	ret = avm_try_fmt(file, fh, f);
 	if (ret)
 		return ret;
 	dev->fmt = f->fmt.pix;
+
+	if (req_w != f->fmt.pix.width || req_h != f->fmt.pix.height) {
+		WRITE_ONCE(dev->req_w, req_w);
+		WRITE_ONCE(dev->req_h, req_h);
+	} else {
+		WRITE_ONCE(dev->req_w, 0);
+		WRITE_ONCE(dev->req_h, 0);
+	}
 	return 0;
 }
 

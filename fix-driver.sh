@@ -24,7 +24,7 @@ set -u
 
 MOD="avmcv710"
 DRV="/sys/bus/usb/drivers/$MOD"
-EXPECTED_SRC="84EB62847AE08B54A924A70"   # 2026-10-16 honest FPS menu (native + half)
+EXPECTED_SRC="6509F7D25BFA05CB7C32311"   # 2026-10-16 overlays restored + non-native out-of-range
 
 [ "$(id -u)" -eq 0 ] || { echo "run as root (sudo ./fix-driver.sh)"; exit 1; }
 

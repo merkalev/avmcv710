@@ -52,9 +52,9 @@ MODULE_SOFTDEP("pre: snd-pcm");
 #define AVM_AUDIO_RING_BYTES	(1u << 20) /* PCM buffer max: ~5.5 s @ 48k */
 #define AVM_AUDIO_PERIOD_MIN	1920	/* 10 ms @ 48k/2ch/S16LE */
 
-static bool avm_audio;		/* opt-in: card registration OFF until hardware-verified */
+static bool avm_audio = true;	/* default 1=on: hardware-verified 2026-10-16 */
 module_param(avm_audio, bool, 0444);
-MODULE_PARM_DESC(avm_audio, "Register the AVMCV710 ALSA capture card at probe (default 0=off; pass avm_audio=1)");
+MODULE_PARM_DESC(avm_audio, "Register the AVMCV710 ALSA capture card at probe (default 1=on; pass avm_audio=0 to disable)");
 static int avm_audio_index = -1;	/* snd-card index, -1 = auto */
 static char *avm_audio_id = "AVMCV710";
 module_param(avm_audio_index, int, 0444);

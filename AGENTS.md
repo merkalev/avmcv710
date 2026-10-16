@@ -324,10 +324,9 @@ Decision tree (implement based ONLY on the result):
 | — | Standalone ALSA audio capture | ✅ Refcounted pipeline in `avm_pipeline_start`/`stop`; `arecord` runs standalone without video player active |
 
 Current module identity (for regression diffing): `srcversion
-72336FB6B7466E80CF2FEAA` (2026-10-16 standalone audio pipeline refcounting + bootstrap analysis
-— see `docs/DEVLOG.md` "### 2026-10-16 (night)"), parms `cvx8897`,
-`avm_audio`
-(bool, default off), `avm_audio_index`, `avm_audio_id`, `auto_reset`
+56AE8A23F24FC5CD731077E` (2026-10-16 audio enabled by default + standalone refcounting
+— see `docs/DEVLOG.md`), parms `cvx8897`, `avm_audio`
+(bool, default on), `avm_audio_index`, `avm_audio_id`, `auto_reset`
 (bool, default off), `softdep: pre: snd-pcm`, 4×2 MB URBs.  `fix-driver.sh`
 expects this srcversion and prints the `rmmod -f` escape hatch if an
 old build's stray ref survives unbind.

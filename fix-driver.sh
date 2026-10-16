@@ -24,7 +24,7 @@ set -u
 
 MOD="avmcv710"
 DRV="/sys/bus/usb/drivers/$MOD"
-EXPECTED_SRC="72336FB6B7466E80CF2FEAA"   # 2026-10-16 standalone audio + bootstrap breakdown
+EXPECTED_SRC="56AE8A23F24FC5CD731077E"   # 2026-10-16 audio enabled by default (hw verified)
 
 [ "$(id -u)" -eq 0 ] || { echo "run as root (sudo ./fix-driver.sh)"; exit 1; }
 

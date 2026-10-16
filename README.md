@@ -60,9 +60,11 @@ everything here.
 - **Frame-rate conversion (opt-in).** `cvx8897=1` maps `S_PARM` onto the
   CVX8897; the advertised interval menu is `{native, native/2}`, because the
   converter can only halve the source rate.
-- **Audio (opt-in).** `avm_audio=1` registers a capture PCM
+- **Audio.** Registers an ALSA capture PCM
   (`hw:CARD=AVMCV710`, S16LE stereo). The sink is pinned to the source's
   sample rate (32 / 44.1 / 48 kHz), read from the HDMI Audio InfoFrame.
+  Enabled by default (`avm_audio=1`). Supports standalone capture (`arecord`)
+  without requiring a video player to be running.
 - **Fast bootstrap.** 871 commands replayed over EP1 from a generated table,
   the same final register state as the full capture but roughly 8x faster.
   `tools/check_bootstrap.py` verifies it (capture parity and the 256-byte
@@ -93,8 +95,8 @@ sudo make dkms-remove
 Or, to free the device and reload cleanly in one step:
 
 ```sh
-sudo ./fix-driver.sh                 # video-only module (audio off, the default)
-sudo ./fix-driver.sh avm_audio=1     # with the ALSA capture card
+sudo ./fix-driver.sh                 # reload clean module (audio enabled by default)
+sudo ./fix-driver.sh avm_audio=0     # disable ALSA card (video-only)
 ```
 
 `fix-driver.sh` installs the tree build first whenever its `srcversion` differs
@@ -113,6 +115,7 @@ v4l2-ctl -d /dev/videoN --list-formats-ext
 v4l2-ctl -d /dev/videoN --log-status
 v4l2-ctl -d /dev/videoN --set-fmt-video=width=1920,height=1080,pixelformat=YUYV
 v4l2-ctl -d /dev/videoN --stream-mmap --stream-count=30 --stream-to=out.yuv
+arecord -D hw:CARD=AVMCV710 -f S16_LE -r 48000 -c 2 -d 5 out.wav
 ```
 
 `v4l2-ctl --log-status` (`VIDIOC_LOG_STATUS`) dumps live receiver lock,
@@ -133,7 +136,7 @@ output mode first.
 | Parameter | Type / access | Default | Meaning |
 | --- | --- | --- | --- |
 | `cvx8897` | int, 0644 (runtime) | `0` | `1` = follow `S_PARM` through the CVX8897 frame-rate converter |
-| `avm_audio` | bool, 0444 | `0` (off) | register the `AVMCV710` ALSA capture card at probe |
+| `avm_audio` | bool, 0444 | `1` (on) | register the `AVMCV710` ALSA capture card at probe (`0` to disable) |
 | `avm_audio_index` | int, 0444 | `-1` | ALSA card index (`-1` = auto) |
 | `avm_audio_id` | charp, 0444 | `"AVMCV710"` | ALSA card id |
 | `auto_reset` | bool, 0644 | `0` (off) | watchdog may `usb_queue_reset_device()` a silent stream |

@@ -789,7 +789,12 @@ ship; C877 is the CV710.)
   bitmaps, ~10 Hz pump, `avm_req_mismatch` for the non-native case.
   `driver_extracted/win/aver_custom_*.bmp` are the vendor bitmaps.
 - [x] Wire `SNDRV_PCM_INFO_RESUME`-safe suspend/resume for audio.
-- [ ] HDCP: keep documentation-only, but log the ADV7604 HDCP state read.
+- [x] HDCP: **won't do** — no implementation, no interrogation, no gating
+  (see the README's *Legal* section and `cv710userspace/ISSUES.md` §6).
+  `AVM_SPLASH_HDCP` / `AVM_SPLASH_CONTENT_PROTECTION` stay compiled in but
+  unreachable: nothing reads the HDCP map, so there is no state to key them on.
+  (An earlier note here proposed logging the ADV7604 HDCP state read; that is
+  exactly the interrogation the project declines.)
 
 ### Never (documented divergence)
 

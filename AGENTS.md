@@ -321,9 +321,11 @@ Decision tree (implement based ONLY on the result):
 | — | HDCP (implementation / interrogation / gating) | won't do (policy, docs only) — see README *Legal* |
 | — | Suspend/resume safe audio | ✅ SNDRV_PCM_INFO_PAUSE/RESUME, trigger ops, buffer_size ring alignment |
 
+| — | Standalone ALSA audio capture | ✅ Refcounted pipeline in `avm_pipeline_start`/`stop`; `arecord` runs standalone without video player active |
+
 Current module identity (for regression diffing): `srcversion
-337EE7D6B3550756C3CFB71` (2026-10-16 deep bug scan + DKMS + `VIDIOC_LOG_STATUS`
-— see `docs/DEVLOG.md` "### 2026-10-16 (late)"), parms `cvx8897`,
+72336FB6B7466E80CF2FEAA` (2026-10-16 standalone audio pipeline refcounting + bootstrap analysis
+— see `docs/DEVLOG.md` "### 2026-10-16 (night)"), parms `cvx8897`,
 `avm_audio`
 (bool, default off), `avm_audio_index`, `avm_audio_id`, `auto_reset`
 (bool, default off), `softdep: pre: snd-pcm`, 4×2 MB URBs.  `fix-driver.sh`

@@ -473,6 +473,8 @@ static void avm_usb_disconnect(struct usb_interface *intf)
 	 */
 	mutex_lock(&dev->stream_lock);
 	was_streaming = dev->streaming;
+	dev->video_streaming = false;
+	dev->audio_streaming = false;
 	dev->streaming = false;
 	mutex_unlock(&dev->stream_lock);
 

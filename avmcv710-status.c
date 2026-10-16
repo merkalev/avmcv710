@@ -364,7 +364,7 @@ static void avm_splash_tick(struct avm_device *dev)
 	unsigned long flags;
 	ktime_t idle;
 
-	if (!READ_ONCE(dev->streaming)) {
+	if (!READ_ONCE(dev->streaming) || !READ_ONCE(dev->video_streaming)) {
 		dev->splash = AVM_SPLASH_NONE;
 		return;
 	}

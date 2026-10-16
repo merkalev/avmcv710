@@ -175,12 +175,21 @@ static int avm_audio_pcm_open(struct snd_pcm_substream *subs)
 static int avm_audio_pcm_close(struct snd_pcm_substream *subs)
 {
 	struct avm_audio *a = snd_pcm_substream_chip(subs);
+	struct avm_device *dev = a->dev;
+	bool was_running;
 	unsigned long flags;
 
 	spin_lock_irqsave(&a->lock, flags);
+	was_running = a->running;
 	a->substream = NULL;
 	a->running = false;
 	spin_unlock_irqrestore(&a->lock, flags);
+
+	if (was_running) {
+		mutex_lock(&dev->stream_lock);
+		avm_pipeline_stop(dev, false);
+		mutex_unlock(&dev->stream_lock);
+	}
 	return 0;
 }
 
@@ -217,10 +226,18 @@ static int avm_audio_pcm_prepare(struct snd_pcm_substream *subs)
 static int avm_audio_pcm_trigger(struct snd_pcm_substream *subs, int cmd)
 {
 	struct avm_audio *a = snd_pcm_substream_chip(subs);
+	struct avm_device *dev = a->dev;
 	unsigned long flags;
+	int ret;
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
+		mutex_lock(&dev->stream_lock);
+		ret = avm_pipeline_start(dev, false);
+		mutex_unlock(&dev->stream_lock);
+		if (ret)
+			return ret;
+
 		spin_lock_irqsave(&a->lock, flags);
 		/* start the capture window clean: drop anything that was
 		 * in flight before the app said go */
@@ -237,9 +254,19 @@ static int avm_audio_pcm_trigger(struct snd_pcm_substream *subs, int cmd)
 		spin_lock_irqsave(&a->lock, flags);
 		a->running = false;
 		spin_unlock_irqrestore(&a->lock, flags);
+
+		mutex_lock(&dev->stream_lock);
+		avm_pipeline_stop(dev, false);
+		mutex_unlock(&dev->stream_lock);
 		return 0;
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
 	case SNDRV_PCM_TRIGGER_RESUME:
+		mutex_lock(&dev->stream_lock);
+		ret = avm_pipeline_start(dev, false);
+		mutex_unlock(&dev->stream_lock);
+		if (ret)
+			return ret;
+
 		spin_lock_irqsave(&a->lock, flags);
 		a->running = true;
 		spin_unlock_irqrestore(&a->lock, flags);

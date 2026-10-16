@@ -235,6 +235,8 @@ struct avm_device {
 
 	/* streaming */
 	bool streaming;			/* protected by stream_lock */
+	bool video_streaming;		/* video consumer active */
+	bool audio_streaming;		/* audio consumer active */
 	struct mutex stream_lock;
 	struct workqueue_struct *wq;
 	struct work_struct parse_work;
@@ -316,6 +318,8 @@ int avm_video_register(struct avm_device *dev);
 void avm_source_change(struct avm_device *dev);
 void avm_live_geometry(struct avm_device *dev, u32 *w, u32 *h);
 bool avm_req_mismatch(struct avm_device *dev, u32 w, u32 h);
+int avm_pipeline_start(struct avm_device *dev, bool is_video);
+void avm_pipeline_stop(struct avm_device *dev, bool is_video);
 
 /* avmcv710-status.c */
 int avm_status_init(struct avm_device *dev);

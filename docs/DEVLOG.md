@@ -58,7 +58,7 @@ Built, awaiting user install/test:
 | Short/partial frame (re-lock) | kept, black-padded `0x80108010` | kept, black-padded (`AVM_PAD_WORD`) | ✅ (test pending) |
 | Res/fps change without restart | yes | yes (V4L2_EVENT_SOURCE_CHANGE) | ✅ |
 | "Video Input Frame Rate" 60/50/30/25 | CVX8897 | CVX8897, opt-in; menu = {native, native/2} only | ✅ |
-| Audio S16LE stereo @ 32/44.1/48 kHz | yes (PCM) | ALSA capture PCM (`avmcv710-audio.c`), opt-in `avm_audio=1`, sink pinned to the source rate from the Audio InfoFrame | ✅ (test pending, opt-in) |
+| Audio S16LE stereo @ 32/44.1/48 kHz | yes (PCM) | ALSA capture PCM (`avmcv710-audio.c`), opt-in `avm_audio=1`, sink pinned to the source rate from the Audio InfoFrame; standalone capture supported via refcounted pipeline | ✅ (test pending, opt-in) |
 | No-signal overlay | yes (BMP splice) | 640x480 BMP (macOS rendition) composited at live geometry, RLE-stored (2026-10-16) | ✅ (test pending) |
 | Out-of-range overlay | yes | receiver-driven **and** non-native S_FMT request (`avm_req_mismatch`), 2026-10-16 | ✅ (test pending) |
 | Content-protection overlay | yes | compiled in (`aver_custom_content_protection.bmp`); trigger not wired (HDCP doc only) | 🟡 doc |
@@ -66,6 +66,8 @@ Built, awaiting user install/test:
 | Warm restart without replug | yes | watchdog diagnosis; opt-in `auto_reset=1` | 🟡 TODO-4 |
 | Clean unload (rmmod without replug) | n/a | unbind drops the ALSA pin in disconnect; rmmod succeeds | ✅ (fixed 2026-10-12) |
 | EDID upload / HPD handshake on start | yes (every open) | yes: 871-cmd trace, 256 B on bridge id 0x36, byte-identical to the vendor binaries' EDID | ✅ |
+| Bootstrap sequence reverse-engineered | yes | 100% of opcodes mapped (Atmel AT88SC CryptoMemory auth, PCA9539, CVX8897 bus 1, ADV7604, EDID, Lattice ECP3); see `docs/BOOTSTRAP.md` & `docs/BOOTSTRAP_I2C.md` | ✅ |
+| Standalone ALSA audio capture | yes | Hardware streaming refcounted across video and audio (`avm_pipeline_start`/`stop`); arecord captures without video running | ✅ (test pending, opt-in) |
 | EP1 wedge recovery | drain + stall service | drain + toggle reset + retry + bounce bufs | ✅ |
 
 ---
@@ -292,10 +294,28 @@ instead of failing silently.
   with video via a refcount; that is a larger change and wants hardware
   testing first.
 
-**Bootstrap blob.**  See `docs/BOOTSTRAP.md`.  696 of the 841 writes are
-ordinary I2C register programming and can be documented; the leading
-FX3/FPGA framing commands carry ~268 bytes of high-entropy payload whose
-purpose is not known.  That section is the real open question.
+### 2026-10-16 (midnight) — reverse-engineering the bootstrap 'goop' & standalone ALSA audio streaming
+
+**1. Bootstrap 'goop' fully reverse-engineered (`docs/BOOTSTRAP.md` and `docs/BOOTSTRAP_I2C.md`):**
+- Disassembled `libC877Driver.dylib` (32-bit i386 macOS binary with full symbols intact).
+- Identified the entire Cypress FX3 bulk EP1 opcode command set (`Fx3Firmware::sendCommand`):
+  - `0x01` / `0x02`: I2C Bus 0 Write / Read (ADV7604, EDID, PCA9539, FPGA)
+  - `0x03` / `0x04`: I2C Bus 1 Write / Read (CVX8897 exclusively)
+  - `0x05` / `0x06` / `0x07`: Atmel AT88 CryptoMemory SendCmd, RevData, SendData
+  - `0x08` / `0x09`: Atmel AT88 PowerOn, WaitClock
+  - `0x0D` / `0x0E`: FX3 SPI Flash Write / Read
+  - `0x0F` / `0x10`: FX3 SPI Flash Sector / Chip Erase
+  - `0x14`: FX3 resetStreamDMA
+- The mysterious ~268 bytes of high-entropy "goop" payload: it is the hardware copy-protection authentication challenge-response and crypto-fuse initialization exchanged between the FX3 microcontroller and an on-board Atmel AT88SC CryptoAuthentication chip (`CryptoAT88::CustomizeHWInit` / `Device::CryptoCheckSecureID`).
+- Documented all 7 execution phases of the 871-command sequence and created a full register reference (`docs/BOOTSTRAP_I2C.md`) for all 696 I2C writes.
+
+**2. Standalone ALSA audio streaming (`avmcv710-audio.c`, `avmcv710-video.c`, `avmcv710-usb.c`, `avmcv710.h`):**
+- Replaced monolithic `avm_start_streaming` / `avm_stop_streaming` with refcounted `avm_pipeline_start(dev, is_video)` and `avm_pipeline_stop(dev, is_video)` under `dev->stream_lock`.
+- `snd_pcm` is configured with `pcm->nonatomic = 1`, so ALSA ops (`.trigger`, `.close`) run in sleepable process context and safely acquire `mutex_lock(&dev->stream_lock)`.
+- When `arecord` runs standalone (`SNDRV_PCM_TRIGGER_START`), it starts the hardware pipeline (URBs, FX3 GPIF DMA reset, FPGA work mode, status worker). The parser demuxes 0x58 audio packets and delivers them into the ALSA DMA ring buffer.
+- When both video and audio are streaming, the hardware pipeline stays alive until *both* consumers have stopped.
+- Splash overlay worker (`avm_status_pump_splash`) gated on `dev->video_streaming` so it skips compositing/logging overlays during audio-only capture.
+- Module compiled with `srcversion 72336FB6B7466E80CF2FEAA`.
 
 ### 2026-10-16 (late) — deep bug scan (4 passes), DKMS, VIDIOC_LOG_STATUS, soft_unbind
 

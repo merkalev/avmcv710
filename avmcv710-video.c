@@ -559,14 +559,19 @@ static void avm_buf_queue(struct vb2_buffer *vb)
 	spin_unlock_irqrestore(&dev->urbs_lock, flags);
 }
 
-static int avm_start_streaming(struct vb2_queue *q, unsigned int count)
+int avm_pipeline_start(struct avm_device *dev, bool is_video)
 {
-	struct avm_device *dev = vb2_get_drv_priv(q);
 	int ret, i = 0;
 
-	/* vb2 core holds q->lock (== stream_lock) while calling this. */
+	/* dev->stream_lock is held by the caller */
+	if (is_video)
+		dev->video_streaming = true;
+	else
+		dev->audio_streaming = true;
+
 	if (dev->streaming)
 		return 0;
+
 	avm_parser_reset(dev);
 
 	/*
@@ -580,10 +585,11 @@ static int avm_start_streaming(struct vb2_queue *q, unsigned int count)
 	dev->watch_last_chunks = atomic64_read(&dev->urb_chunks);
 	dev->watch_silent = false;
 	dev_info(&dev->udev->dev,
-		 "STREAMON: %ux%u YUYV, cvx=%s req_fps=%u\n",
+		 "STREAMON: %ux%u YUYV, cvx=%s req_fps=%u (trigger=%s)\n",
 		 dev->fmt.width, dev->fmt.height,
 		 avm_cvx8897_enabled() ? "on" : "off",
-		 READ_ONCE(dev->cvx_req_fps));
+		 READ_ONCE(dev->cvx_req_fps),
+		 is_video ? "video" : "audio");
 
 	/* Drop any error state left from a previous stream. */
 	for (i = 0; i < AVM_NUM_URBS; i++) {
@@ -647,25 +653,41 @@ static int avm_start_streaming(struct vb2_queue *q, unsigned int count)
 	return 0;
 
 err:
-	dev_err(&dev->udev->dev, "start_streaming failed: %d (URB %d)\n",
+	dev_err(&dev->udev->dev, "pipeline start failed: %d (URB %d)\n",
 		ret, i);
 	/* Symmetric with stop_streaming: no URBs may outlive this fail. */
 	WRITE_ONCE(dev->streaming, false);
 	usb_kill_anchored_urbs(&dev->urb_anchor);
 	flush_workqueue(dev->wq);
-	/* vb2 re-queues on a failed STREAMON, so hand buffers back QUEUED
-	 * (not ERROR) - see avm_return_buffers() and videobuf2-core.h. */
-	avm_return_buffers(dev, VB2_BUF_STATE_QUEUED);
+	if (is_video)
+		avm_return_buffers(dev, VB2_BUF_STATE_QUEUED);
 	avm_fpga_work_mode(dev, false);
+	if (is_video)
+		dev->video_streaming = false;
+	else
+		dev->audio_streaming = false;
 	return ret;
 }
 
-static void avm_stop_streaming(struct vb2_queue *q)
+void avm_pipeline_stop(struct avm_device *dev, bool is_video)
 {
-	struct avm_device *dev = vb2_get_drv_priv(q);
 	unsigned long flags;
 
-	/* vb2 core holds q->lock (== stream_lock) while calling this. */
+	/* dev->stream_lock is held by the caller */
+	if (is_video) {
+		dev->video_streaming = false;
+		avm_return_buffers(dev, VB2_BUF_STATE_ERROR);
+	} else {
+		dev->audio_streaming = false;
+	}
+
+	/* Keep hardware pipeline streaming if another consumer is still active */
+	if (dev->video_streaming || dev->audio_streaming)
+		return;
+
+	if (!dev->streaming)
+		return;
+
 	WRITE_ONCE(dev->streaming, false);
 
 	/* Cancel the receiver telemetry poll and CVX8897 worker first: both
@@ -680,11 +702,6 @@ static void avm_stop_streaming(struct vb2_queue *q)
 	 * shutdown (UsbStream::shutdownStream performs setFpgaIdle +
 	 * sendResetStreamDma while the frame transfers are still active, and
 	 * only then cancels them).
-	 *
-	 * Killing the video URBs first leaves the FX3 mid-DMA with its bulk IN
-	 * endpoint torn down; the firmware then stops servicing the EP1 control
-	 * pipe, the park write times out (-110) and every later command hangs
-	 * until the device is replugged.
 	 */
 	avm_fpga_work_mode(dev, false);
 	avm_reset_stream_dma(dev);
@@ -709,8 +726,6 @@ static void avm_stop_streaming(struct vb2_queue *q)
 	INIT_LIST_HEAD(&dev->drain_list);
 	spin_unlock_irqrestore(&dev->urbs_lock, flags);
 
-	avm_return_buffers(dev, VB2_BUF_STATE_ERROR);
-
 	/* Parser stays reset until the next STREAMON. */
 	avm_fpga_work_mode(dev, false);
 
@@ -721,6 +736,20 @@ static void avm_stop_streaming(struct vb2_queue *q)
 		atomic_read(&dev->parser.corrupt_frames),
 		atomic_read(&dev->parser.padded_frames),
 		atomic_read(&dev->parser.resync_count));
+}
+
+static int avm_start_streaming(struct vb2_queue *q, unsigned int count)
+{
+	struct avm_device *dev = vb2_get_drv_priv(q);
+
+	return avm_pipeline_start(dev, true);
+}
+
+static void avm_stop_streaming(struct vb2_queue *q)
+{
+	struct avm_device *dev = vb2_get_drv_priv(q);
+
+	avm_pipeline_stop(dev, true);
 }
 
 static const struct vb2_ops avm_vb2_ops = {

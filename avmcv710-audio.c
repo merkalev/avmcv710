@@ -139,6 +139,10 @@ static int avm_audio_pcm_open(struct snd_pcm_substream *subs)
 	unsigned long flags;
 
 	spin_lock_irqsave(&a->lock, flags);
+	if (a->dying) {
+		spin_unlock_irqrestore(&a->lock, flags);
+		return -ENODEV;
+	}
 	if (a->substream) {	/* one capture client at a time */
 		spin_unlock_irqrestore(&a->lock, flags);
 		return -EBUSY;

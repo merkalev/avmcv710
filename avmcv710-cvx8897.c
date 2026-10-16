@@ -117,6 +117,8 @@ int avm_cvx8897_apply(struct avm_device *dev, const u8 *values)
 	int failures = 0;
 
 	for (i = 0; i < AVM_CVX_REG_COUNT; i++) {
+		if (!READ_ONCE(dev->streaming))
+			return -ECANCELED;
 		if (avm_i2c_write(dev, AVM_CVX_I2C_ADDR,
 				  avm_cvx_reg_order[i], values[i]))
 			failures++;

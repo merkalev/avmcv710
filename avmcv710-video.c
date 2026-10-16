@@ -88,18 +88,23 @@ void avm_live_geometry(struct avm_device *dev, u32 *w, u32 *h)
 		spin_lock_irqsave(&dev->sig_lock, flags);
 		if (dev->sig.valid && dev->sig.tmds_locked &&
 		    dev->sig.w >= 320 && dev->sig.w <= 4095 &&
+		    (dev->sig.w & 1) == 0 &&
 		    dev->sig.h >= 120 && dev->sig.h <= 2048) {
 			ww = dev->sig.w;
 			hh = dev->sig.h;
 			interlaced = dev->sig.interlaced;
 		}
 		spin_unlock_irqrestore(&dev->sig_lock, flags);
+		if (interlaced && hh <= 700)
+			hh *= 2;
+		if ((u64)ww * hh / 2 > AVM_MAX_FRAME_WORDS) {
+			ww = 0;
+			hh = 0;
+		}
 	}
 	if (!ww || !hh) {
 		ww = 1920;
 		hh = 1080;
-	} else if (interlaced && hh <= 700) {
-		hh *= 2;
 	}
 	*w = ww;
 	*h = hh;
@@ -663,10 +668,11 @@ static void avm_stop_streaming(struct vb2_queue *q)
 	/* vb2 core holds q->lock (== stream_lock) while calling this. */
 	WRITE_ONCE(dev->streaming, false);
 
-	/* Cancel the receiver telemetry poll first: the worker stops
-	 * re-arming as soon as streaming clears, and this waits out any
-	 * in-flight I2C read before we park the FPGA below. */
+	/* Cancel the receiver telemetry poll and CVX8897 worker first: both
+	 * stop as soon as streaming clears, and this waits out any in-flight
+	 * EP1 I2C transaction before we park the FPGA below. */
 	avm_status_stop(dev);
+	cancel_work_sync(&dev->cvx_work);
 
 	/*
 	 * Park the FPGA (stop it producing frames) and reset the FX3 DMA

@@ -256,7 +256,10 @@ void avm_parser_reset(struct avm_device *dev)
 	p->active_h = 0;
 	p->active_interlaced = false;
 	p->target_words = 0;
-	p->mode_serial = 0;
+	/* Keep mode_serial monotonic across STREAMOFF/STREAMON so a new stream's
+	 * first locked mode never aliases dev->cvx_prog_serial from an earlier
+	 * stream. */
+	WRITE_ONCE(p->mode_serial, READ_ONCE(p->mode_serial) + 1);
 	p->frame_sequence = 0;
 	/* stamp a fresh stream as live; the overlay pump (avmcv710-status.c)
 	 * uses last_real_kt to tell "real video flowing" from "show a splash" */

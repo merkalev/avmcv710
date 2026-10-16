@@ -439,8 +439,8 @@ static void avm_watchdog(struct work_struct *work)
 					 "a soft reload? Replug the device\n");
 				if (auto_reset) {
 					dev_info(&dev->udev->dev,
-						 "watchdog: auto_reset enabled; attempting usb_reset_device()\n");
-					usb_reset_device(dev->udev);
+						 "watchdog: auto_reset enabled; queueing USB interface reset\n");
+					usb_queue_reset_device(dev->intf);
 				}
 			}
 		} else if (dev->watch_silent) {

@@ -273,10 +273,34 @@ and — when the old build's invisible stray ref survives — prints the
 deliberate `sudo rmmod -f avmcv710 && sudo modprobe avmcv710` escape hatch
 instead of failing silently.
 
+### 2026-10-16 (night) — audio push fixes; bootstrap blob analysed
+
+**Audio (`avmcv710-audio.c`, build only, not hardware-tested).**
+- A packet larger than the negotiated ring (packets go up to 8192 B,
+  `period_bytes_min` is 1920) was dropped whole, so a small-buffer client
+  heard nothing.  The newest `size` bytes are now kept and the write pointer
+  still advances by the full amount.
+- While the receiver positively reports TMDS unlocked, the 0x58 payload is
+  replaced by silence instead of being copied.  The userspace driver gates
+  the same bus noise (`cv710userspace/ISSUES.md` section 4).  Silence, not a
+  drop, so the PCM pointer keeps its timing.  Before the first poll
+  (`sig.valid` false) audio passes.
+- Known gap, not changed: audio is only produced while a video capture holds
+  the stream open (URBs and FPGA work mode are started from
+  `avm_start_streaming()`), so a standalone `arecord` hears nothing.
+  Fixing it means starting the pipeline from PCM open/trigger and sharing it
+  with video via a refcount; that is a larger change and wants hardware
+  testing first.
+
+**Bootstrap blob.**  See `docs/BOOTSTRAP.md`.  696 of the 841 writes are
+ordinary I2C register programming and can be documented; the leading
+FX3/FPGA framing commands carry ~268 bytes of high-entropy payload whose
+purpose is not known.  That section is the real open question.
+
 ### 2026-10-16 (late) — deep bug scan (4 passes), DKMS, VIDIOC_LOG_STATUS, soft_unbind
 
 Audit across `avmcv710-parser.c`, `-status.c`, `-video.c`, `-cvx8897.c`,
-`-audio.c`, `-usb.c` (`srcversion C18737C64885DAE764351AB`).  Descriptions
+`-audio.c`, `-usb.c` (`srcversion 337EE7D6B3550756C3CFB71`).  Descriptions
 below were checked against the commit diffs.
 
 **Parser (`avmcv710-parser.c`)**

@@ -300,6 +300,25 @@ static const struct snd_pcm_ops avm_audio_ops = {
 /* ------------------------------------------------------------------ */
 /* Parser entry: push captured 0x58 payload bytes into the PCM buffer  */
 
+/*
+ * While the receiver is known to be unlocked the FX3 FIFO streams bus noise
+ * in the 0x58 packets (cv710userspace ISSUES.md section 4: the "audio
+ * buzzing" bug, fixed there by a video-lock gate).  The PCM must keep its
+ * timing - capture clients expect a steady pointer - so the noise is replaced
+ * by silence rather than dropped.  Only a *positive* unlock mutes: before the
+ * first status poll (sig.valid false) or if the poll fails, audio passes.
+ */
+static bool avm_audio_muted(struct avm_device *dev)
+{
+	unsigned long flags;
+	bool muted;
+
+	spin_lock_irqsave(&dev->sig_lock, flags);
+	muted = dev->sig.valid && !dev->sig.tmds_locked;
+	spin_unlock_irqrestore(&dev->sig_lock, flags);
+	return muted;
+}
+
 void avm_audio_push(struct avm_device *dev, const u8 *src, u32 bytes)
 {
 	struct avm_audio *a = READ_ONCE(dev->audio);
@@ -307,10 +326,14 @@ void avm_audio_push(struct avm_device *dev, const u8 *src, u32 bytes)
 	struct snd_pcm_substream *subs;
 	unsigned long flags;
 	u32 size, pos, first;
+	u64 before;
 	unsigned int periods = 0;
+	bool mute;
 
 	if (!a || !bytes)
 		return;
+
+	mute = avm_audio_muted(dev);
 
 	spin_lock_irqsave(&a->lock, flags);
 	/* no consumer (never opened / stopped / dying): drop on the floor */
@@ -335,19 +358,36 @@ void avm_audio_push(struct avm_device *dev, const u8 *src, u32 bytes)
 		spin_unlock_irqrestore(&a->lock, flags);
 		return;
 	}
+	/*
+	 * A packet can be larger than a small negotiated ring (period_bytes_min
+	 * is 1920, a packet up to 8192).  The old code dropped the whole packet
+	 * and the application never heard anything.  Keep the newest `size`
+	 * bytes instead: the ring is cyclic, so everything older would be
+	 * overwritten anyway; the pointer still advances by the full amount.
+	 */
+	before = a->base;
 	if (bytes > size) {
-		a->overruns += bytes;
-		spin_unlock_irqrestore(&a->lock, flags);
-		return;
+		u32 skip = bytes - size;
+
+		a->overruns += skip;
+		a->base += skip;
+		src += skip;
+		bytes = size;
 	}
 
 	pos = (u32)(a->base % size);
 	first = size - pos;
 	if (first > bytes)
 		first = bytes;
-	memcpy(rt->dma_area + pos, src, first);
-	if (bytes > first)
-		memcpy(rt->dma_area, src + first, bytes - first);
+	if (mute) {
+		memset(rt->dma_area + pos, 0, first);
+		if (bytes > first)
+			memset(rt->dma_area, 0, bytes - first);
+	} else {
+		memcpy(rt->dma_area + pos, src, first);
+		if (bytes > first)
+			memcpy(rt->dma_area, src + first, bytes - first);
+	}
 
 	a->base += bytes;
 	a->produced += bytes;
@@ -356,7 +396,6 @@ void avm_audio_push(struct avm_device *dev, const u8 *src, u32 bytes)
 	 * several periods' worth of audio; 8192 B / 1920 B period = 4) */
 	if (rt->frame_bits && rt->period_size) {
 		u32 pbytes = frames_to_bytes(rt, rt->period_size);
-		u64 before = a->base - bytes;
 
 		if (pbytes)
 			periods = (unsigned int)(a->base / pbytes -

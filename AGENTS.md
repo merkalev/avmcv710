@@ -322,7 +322,7 @@ Decision tree (implement based ONLY on the result):
 | — | Suspend/resume safe audio | ✅ SNDRV_PCM_INFO_PAUSE/RESUME, trigger ops, buffer_size ring alignment |
 
 Current module identity (for regression diffing): `srcversion
-C18737C64885DAE764351AB` (2026-10-16 deep bug scan + DKMS + `VIDIOC_LOG_STATUS`
+337EE7D6B3550756C3CFB71` (2026-10-16 deep bug scan + DKMS + `VIDIOC_LOG_STATUS`
 — see `docs/DEVLOG.md` "### 2026-10-16 (late)"), parms `cvx8897`,
 `avm_audio`
 (bool, default off), `avm_audio_index`, `avm_audio_id`, `auto_reset`

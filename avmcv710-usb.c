@@ -459,6 +459,7 @@ static void avm_watchdog(struct work_struct *work)
 static void avm_usb_disconnect(struct usb_interface *intf)
 {
 	struct avm_device *dev = usb_get_intfdata(intf);
+	bool was_streaming;
 
 	if (!dev)
 		return;
@@ -471,6 +472,7 @@ static void avm_usb_disconnect(struct usb_interface *intf)
 	 * that is still holding the video node.
 	 */
 	mutex_lock(&dev->stream_lock);
+	was_streaming = dev->streaming;
 	dev->streaming = false;
 	mutex_unlock(&dev->stream_lock);
 
@@ -478,14 +480,19 @@ static void avm_usb_disconnect(struct usb_interface *intf)
 	avm_status_stop(dev);
 
 	/*
-	 * Park the FPGA (stop producing frames) and reset FX3 stream DMA
-	 * *before* killing the EP 0x83 video URBs, mirroring UsbStream::shutdownStream.
+	 * If a consumer was actively streaming across a soft unbind, park the
+	 * FPGA (stop producing frames) and reset FX3 stream DMA *before*
+	 * killing the EP 0x83 video URBs, mirroring UsbStream::shutdownStream.
 	 * Killing URBs while the FPGA is actively transmitting leaves the FX3
 	 * mid-DMA with nowhere to drain, wedging EP1 and causing all future
 	 * bootstrap/control commands to timeout (-110) on subsequent probes.
+	 * When not streaming, avm_stop_streaming() (or probe()) already parked
+	 * the pipeline; when physically unplugged, endpoints are already gone.
 	 */
-	avm_fpga_work_mode(dev, false);
-	avm_reset_stream_dma(dev);
+	if (was_streaming && dev->udev->state != USB_STATE_NOTATTACHED) {
+		avm_fpga_work_mode(dev, false);
+		avm_reset_stream_dma(dev);
+	}
 
 	usb_kill_anchored_urbs(&dev->urb_anchor);
 	cancel_delayed_work_sync(&dev->watch_work);
@@ -530,6 +537,7 @@ static struct usb_driver avm_usb_driver = {
 	.probe		= avm_usb_probe,
 	.disconnect	= avm_usb_disconnect,
 	.id_table	= avm_usb_ids,
+	.soft_unbind	= 1,
 };
 
 module_usb_driver(avm_usb_driver);

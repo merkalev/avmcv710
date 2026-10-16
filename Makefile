@@ -23,13 +23,15 @@ ccflags-y += -Wframe-larger-than=2048
 
 # Convenience wrapper for out-of-tree builds:
 KDIR ?= $(shell if [ -d "/lib/modules/$$(uname -r)/build" ]; then echo "/lib/modules/$$(uname -r)/build"; else ls -d /lib/modules/*/build 2>/dev/null | sort -V | tail -n 1; fi)
+LLVM ?= $(shell grep -q '^CONFIG_CC_IS_CLANG=y' "$(KDIR)/.config" 2>/dev/null && echo 1)
+KBUILD_ARGS := $(if $(LLVM),LLVM=$(LLVM))
 
 .PHONY: modules clean install
 modules:
-	$(MAKE) -C $(KDIR) M=$(CURDIR) modules
+	$(MAKE) -C $(KDIR) M=$(CURDIR) $(KBUILD_ARGS) modules
 
 clean:
-	$(MAKE) -C $(KDIR) M=$(CURDIR) clean
+	$(MAKE) -C $(KDIR) M=$(CURDIR) $(KBUILD_ARGS) clean
 
 install: modules
-	$(MAKE) -C $(KDIR) M=$(CURDIR) modules_install
+	$(MAKE) -C $(KDIR) M=$(CURDIR) $(KBUILD_ARGS) modules_install

@@ -24,7 +24,7 @@ set -u
 
 MOD="avmcv710"
 DRV="/sys/bus/usb/drivers/$MOD"
-EXPECTED_SRC="5CFFCBFB67D12FA0BD04328"   # 2026-10-16 audio: source-paced rate from the Audio InfoFrame
+EXPECTED_SRC="88A8461A0A19B27F5F0F8F9"   # 2026-10-16 usb: soft_unbind + stream-gated disconnect park
 
 [ "$(id -u)" -eq 0 ] || { echo "run as root (sudo ./fix-driver.sh)"; exit 1; }
 
@@ -135,7 +135,7 @@ else
 	echo "OK: no AVMCV710 sound card registered"
 fi
 [ -e /dev/video0 ] && echo "OK: /dev/video0 present" || echo "WARN: /dev/video0 missing"
-src="$(modinfo "$MOD" 2>/dev/null | grep -m1 '^srcversion' | awk '{print $2}')"
+src="$(cat "/sys/module/$MOD/srcversion" 2>/dev/null || modinfo "$MOD" 2>/dev/null | grep -m1 '^srcversion' | awk '{print $2}')"
 echo "module srcversion: ${src:-n/a} (expected $EXPECTED_SRC)"
 [ "$src" = "$EXPECTED_SRC" ] || echo "WARN: loaded module is not the fixed build"
 lsmod | grep "^$MOD "

@@ -143,11 +143,12 @@ work (state, commands, RE facts, pitfalls, open tickets) is
 | `avmcv710-video.c` | V4L2 + vb2 queue, format negotiation, streaming lifecycle |
 | `avmcv710-cvx8897.c` | CVX8897 frame-rate converter (opt-in 60→30 / 50→25) |
 | `avmcv710-audio.c` | ALSA capture PCM (`hw:CARD=AVMCV710`, S16LE stereo 48 kHz) |
-| `avmcv710-status.c` | ADV7604 status poll (10 Hz while streaming) + no-signal/out-of-range overlays |
+| `avmcv710-status.c` | ADV7604 status poll (1 Hz while streaming) + no-signal/out-of-range overlays |
 | `avmcv710-bootstrap.h` | pre-parsed 871-command bootstrap table (tracked) |
 | `avmcv710-bmp.h` | generated (gitignored) 640×480 YUY2 overlay bitmaps |
 | `avmcv710-cvx8897.h` | generated (gitignored) CVX8897 register tables |
 | `tools/gen_bootstrap.py` | generates `avmcv710-bootstrap.h` from the original trace |
+| `tools/check_bootstrap.py` | verifies the generated bootstrap (capture parity + EDID vs the vendor binaries) |
 | `tools/gen_bmp.py` | generates `avmcv710-bmp.h` |
 | `tools/gen_cvx8897.py` | generates `avmcv710-cvx8897.h` from the userspace tables |
 

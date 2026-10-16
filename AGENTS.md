@@ -215,10 +215,15 @@ Decision tree (implement based ONLY on the result):
   (`AVM_CHUNK_BYTES`), framing markers `C0`/`C1` words; C1 = frame/field with
   a word count, audio interleaved with marker `0x58FFFF00`.  This is the same
   C0/C1 protocol as the userspace port — `cv710userspace` is the reference.
-- **Bootstrap:** probe replays the vendor's 871-command trace over EP1
-  (I2C writes to slaves 0x20/0x34/0x22/0x50 etc., incl. the 22× 256-byte EDID
-  writes to 0x50).  First EP1 read after warm start can return a stale byte:
-  drain EP1 before trusting the sequence.
+- **Bootstrap:** probe replays the vendor's 871-command trace over EP1 —
+  696 I2C writes across the ADV7604 IO/HDMI/CP maps (bridge ids 0x20/0x34/
+  0x22), the PCA9539 at 0x74, the EDID EEPROM bridge at 0x36 (8×32 B = the
+  vendor's 256-byte EDID, byte-identical to the copy embedded in
+  `avmu3_x64.sys` and `libC877Driver.dylib`), plus CLFE3/FPGA opcodes
+  0x03/0x05/0x06/0x07/0x09 and the leading FX3 opcode 0x0e.  Verified by
+  `tools/check_bootstrap.py` (see DEVLOG `### 2026-10-16 — BOOTSTRAP-PARITY`).
+  First EP1 read after warm start can return a stale byte: drain EP1 before
+  trusting the sequence.
 - **Frame path:** FPGA passes the raster through (no scaling — resolution is
   NOT scalable).  Parser locks a mode via word-count (1080p 1036800, 1080i
   518400, 720p 460800, 576p 207360, 576i 103680, 480p 172800, 480i 86400) with
@@ -300,7 +305,7 @@ Decision tree (implement based ONLY on the result):
 | FPS-MENU | Frame-interval menu now = {native, native/2} (half only with `cvx8897=1`) | done 2026-10-16 — **user test pending** |
 | RES-OVERLAY | Non-native resolution: vendor paints `aver_custom_out_of_range.bmp`; we show the same overlay via `avm_req_mismatch` | done 2026-10-16 — **user test pending** |
 | FRAMING-LAYER | Where the vendor parses C0/C1 | resolved 2026-10-16: in the driver, byte-wise marker dispatch (readable in `libC877Driver.dylib`) |
-| BOOTSTRAP-PARITY | Diff 871-cmd replay vs `CRXADV7604`/`CLFE3` init in the `.sys` | open |
+| BOOTSTRAP-PARITY | Diff 871-cmd replay vs `CRXADV7604`/`CLFE3` init in the `.sys` | resolved 2026-10-16: replay == reference capture (0 diffs), trim state-preserving (132 regs), EDID byte-identical to the vendor binaries — `tools/check_bootstrap.py` |
 | — | 2026-10-12 bug-hunt fixes (8 bugs: unload pin, adaptive-mode dead delivery, sequence race, adapter shared scratch mode, URB fail-path leak, status-work pre-init cancel, bootstrap scratch guard, audio hw_free barrier) | fixed + committed; see `### 2026-10-12 (late)` devlog entry |
 | — | 2026-10-13 bug-hunt & completion (DMA bounce buffers, inter-frame audio, alignment, colorspace auto-detection, ALSA 32k/44.1k/48k, EPIPE stall recovery, auto_reset watchdog) | fixed + compiled; see `### 2026-10-13` devlog entry |
 | — | Converter RGB-vs-422 (AVI colorspace flag) | ✅ auto-detected via HDMI 0x34 reg 0x53 (720p60 RGB table selected) |

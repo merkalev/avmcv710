@@ -64,7 +64,7 @@ Built, awaiting user install/test:
 | Receiver status (lock/RGB/rate) | ~10 Hz poll | 1 Hz poll while streaming → `dev->sig` | ✅ (test pending) |
 | Warm restart without replug | yes | watchdog diagnosis; opt-in `auto_reset=1` | 🟡 TODO-4 |
 | Clean unload (rmmod without replug) | n/a | unbind drops the ALSA pin in disconnect; rmmod succeeds | ✅ (fixed 2026-10-12) |
-| EDID upload / HPD handshake on start | yes (every open) | yes (in 871-cmd trace, 0x50 ×N) | ✅ |
+| EDID upload / HPD handshake on start | yes (every open) | yes: 871-cmd trace, 256 B on bridge id 0x36, byte-identical to the vendor binaries' EDID | ✅ |
 | EP1 wedge recovery | drain + stall service | drain + toggle reset + retry + bounce bufs | ✅ |
 
 ---
@@ -271,6 +271,51 @@ vdev release), prints `/sys/module/avmcv710/refcnt` while retrying rmmod,
 and — when the old build's invisible stray ref survives — prints the
 deliberate `sudo rmmod -f avmcv710 && sudo modprobe avmcv710` escape hatch
 instead of failing silently.
+
+### 2026-10-16 — BOOTSTRAP-PARITY: the 871-command replay vs the vendor init
+
+Ticket: "Diff 871-cmd replay vs `CRXADV7604`/`CLFE3` init in `avmu3_x64.sys`."
+The replay in `avmcv710-hw.c` is not hand-derived — `tools/gen_bootstrap.py`
+emits it verbatim from the community port's fast-start capture, which is
+itself a recording of the official driver's real USB EP1 traffic.  So the
+honest question is whether that recording still *is* the vendor's init and
+whether the fast trim kept the end state.  Both are now checked mechanically
+by `tools/check_bootstrap.py` (exit 0 = parity):
+
+1. **Header == reference capture.**  871 commands, 4495 write bytes,
+   **0 differences** against `commanddata_cv710_fast.cpp`.  (The read counts
+   are decimal: `UsbStream.cpp` parses them with `std::stoi` base 10, so
+   `<512` is 512 bytes, not `0x512`.)
+2. **The trim is state-preserving.**  All 841 fast writes appear, **in
+   order**, among the 4301 writes of the 7108-command full capture
+   (`commanddata_cv710.cpp`), and the final single-register I2C state is
+   identical (132 `(bridge-id, reg)` entries, none only-in-full, none
+   only-in-fast, none differing).  The trim removes reads and collapsed poll
+   loops only.
+3. **The EDID is the vendor's EDID.**  The replay uploads 256 bytes to EP1
+   bridge id 0x36; that byte string is present *identical* in
+   `driver_extracted/win/avmu3_x64.sys` (file offset 0xd9fb0) and in
+   `driver_extracted/mac/.../libC877Driver.dylib` (0x4669c), and absent from
+   the sibling `libC875Driver.dylib`.  (Earlier notes said "22× 256-byte EDID
+   writes to 0x50"; the decode is 8× 32-byte writes to bridge id 0x36 —
+   corrected in the matrix and §6.)
+
+Decode of the write stream (841 writes): leading-byte histogram
+`0x01:696 0x03:16 0x05:56 0x06:29 0x07:27 0x08:1 0x09:15 0x0e:1`; the `0x01`
+writes are `01 <bridge-id> <reglen> <reg..> <data..>` and cover the ADV7604
+IO map (0x20, 521), HDMI map (0x34, 28), content-protection map (0x22, 32),
+plus 0x10 (29), 0x18 (2), 0x26 (7), 0x32 (11), 0x36 (EDID), and the PCA9539
+GPIO expander (0x74, 42).  The `0x03/0x05/0x06/0x07/0x09` writes are the
+CLFE3/FPGA bring-up (address + payload + commit bursts) and `0x0e` is the
+leading FX3 setup word.
+
+What cannot be done from the binaries: the vendor's ADV7604/CLFE3 init is
+emitted by library calls (`CRXADV7604::Costomize7604Init` is a few method
+calls; the ADI driver synthesises the I2C writes at run time), so no flat
+register list exists to diff value-by-value.  The capture — which we replay
+byte-for-byte and have now pinned to the vendor EDID — *is* the artifact.
+Residual (hardware-only) risk: the captured session could predate a vendor
+init change.
 
 ### 2026-10-16 — standby overlays restored (no-signal / out-of-range)
 
@@ -538,8 +583,9 @@ tuning) — **not FX3/EP1 commands**.  Nothing to port to the kernel.
 - The userspace replays the **full bootstrap on every open** ("re-uploads the
   256-byte EDID and drives the HPD handshake"; skipping it on warm start
   left stale mode lists until a physical replug).  Our probe replays the same
-  871-command trace (slave 0x50 EDID writes present, ×22), so that part is
-  covered.
+  871-command trace, including the EDID upload (256 B to bridge id 0x36,
+  byte-identical to the vendor binaries — see the BOOTSTRAP-PARITY entry), so
+  that part is covered.
 - Sound: `setVideoInput(HDMI)` writes IO 0x20 {0x00→0x08, 0x01→0x06,
   0x02→0xFC, 0x05→0x2C} (power-on / HDMI auto-detect / eq) once at startup.
 - Stream start order — ours matches exactly:
@@ -636,13 +682,29 @@ ship; C877 is the CV710.)
   parser drops live frames while the mismatch holds); a `S_FMT` matching the
   reported geometry clears it, so OBS's normal "accept the device format" path
   is unaffected.  Pending user hardware test.
-- [ ] **BOOTSTRAP-PARITY — 871-command replay vs `CRXADV7604`/`CLFE3` init.**
-  Diff our `avmcv710-bootstrap.h` trace against the vendor's
-  `CRXADV7604::HardwareInit` / `ConfigureRx` / `ADIAPI_TvInit` and the
-  `CLFE3` bring-up (`SetWorkMode`/`SetIdleMode`/`SetInterPattern`) to confirm
-  the write set and ordering (slaves `0x20`/`0x34`/`0x22`/`0x50`, the 22×
-  EDID writes) match, or document the intentional divergence.
-  (`CLFE3::SetInterPattern` and `SetPWMMode` have no kernel counterpart.)
+- [x] **BOOTSTRAP-PARITY — 871-command replay vs `CRXADV7604`/`CLFE3` init.**
+  **RESOLVED 2026-10-16** (see the dated entry above and
+  `tools/check_bootstrap.py`).  The replay is not a hand-written sequence: it
+  is the recorded EP1 traffic of the official driver, so parity holds by
+  construction, and the three things that could have drifted are now checked
+  mechanically:
+  1. our `avmcv710-bootstrap.h` == the reference fast-start capture
+     (`commanddata_cv710_fast.cpp`), 871 commands / 4495 write bytes, 0 diffs;
+  2. every one of the 841 fast writes occurs, in order, in the 7108-command
+     full capture (`commanddata_cv710.cpp`), and the two reach an identical
+     final I2C register map (132 `(bridge-id, reg)` entries) — the trim drops
+     only reads/poll loops;
+  3. the 256-byte EDID the replay uploads is byte-identical to the EDID
+     embedded in `avmu3_x64.sys` (0xd9fb0) and `libC877Driver.dylib`
+     (0x4669c) — and absent from the sibling `libC875Driver.dylib`.
+  The vendor emits its ADV7604/CLFE3 init through library calls
+  (`CRXADV7604::Costomize7604Init` is a handful of method calls, not a
+  register table; the ADI driver builds the I2C writes at run time), so no
+  flat register list can be lifted from the binaries to diff value-by-value —
+  the capture is the authoritative artifact and it is what we replay.  The
+  remaining risk is unfalsifiable without hardware: that the captured session
+  predates a vendor init change.  (`CLFE3::SetInterPattern` and `SetPWMMode`
+  still have no kernel counterpart; the replay covers the reachable state.)
 
 ### P1 — correctness of what we already have
 

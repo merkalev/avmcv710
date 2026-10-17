@@ -224,10 +224,20 @@ struct avm_device {
 
 	struct v4l2_pix_format fmt;	/* current negotiated format */
 
-	/* What the consumer last asked S_FMT for.  The FPGA cannot scale, so
-	 * when this differs from the live source geometry the device shows
-	 * the vendor's "signal out of range" overlay instead of live frames
-	 * (avm_req_mismatch()).  0/0 = follow the source. */
+	/* Negotiated buffer geometry: what the consumer last asked S_FMT for.
+	 * The FPGA cannot scale, so when this differs from the live source
+	 * geometry the parser gates live frames out and the device shows the
+	 * vendor's "signal out of range" overlay (avm_req_mismatch()). */
+	u32 qfmt_w, qfmt_h;	/* format the queued buffers were allocated
+				 * for (snapshot at start_streaming); the
+				 * parser delivery gate compares against
+				 * this, not against ->fmt, which may
+				 * already have followed a new source mode
+				 * while the consumer renegotiates */
+	/* Consumer accepted the live geometry at S_FMT ("leave unchanged"):
+	 * dev->fmt then follows a mid-stream source resolution change and
+	 * V4L2_EVENT_SOURCE_CHANGE makes the consumer renegotiate buffers. */
+	bool follow_source;
 	u32 req_w, req_h;
 	struct v4l2_fract req_tpf;
 
@@ -319,6 +329,7 @@ bool avm_cvx8897_enabled(void);
 int avm_video_register(struct avm_device *dev);
 void avm_source_change(struct avm_device *dev);
 void avm_live_geometry(struct avm_device *dev, u32 *w, u32 *h);
+void avm_publish_geometry(struct avm_device *dev, u32 w, u32 h);
 bool avm_req_mismatch(struct avm_device *dev, u32 w, u32 h);
 int avm_pipeline_start(struct avm_device *dev, bool is_video);
 void avm_pipeline_stop(struct avm_device *dev, bool is_video);

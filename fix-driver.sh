@@ -24,7 +24,7 @@ set -u
 
 MOD="avmcv710"
 DRV="/sys/bus/usb/drivers/$MOD"
-EXPECTED_SRC="DE9D17942810A25B0C050D8"   # 2026-10-16 fix No-Signal Out-of-Range priority & resolution mismatch gating
+EXPECTED_SRC="7FB4588D3997E7F77764BD7"   # 2026-10-17 honest fps menu, leave-unchanged format follow, qfmt delivery gate
 
 [ "$(id -u)" -eq 0 ] || { echo "run as root (sudo ./fix-driver.sh)"; exit 1; }
 

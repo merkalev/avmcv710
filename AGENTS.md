@@ -94,10 +94,10 @@ sudo rmmod avmcv710 && sudo modprobe avmcv710
 journalctl -k -f          # kernel ring buffer (dmesg is NOT readable)
 ```
 
-Kernel: `7.2.6-1-cachyos` (CachyOS), full build tree at
+Kernel: `7.2.9-2-cachyos` (CachyOS), full build tree at
 `/lib/modules/$(uname -r)/build`.  Module params: `cvx8897` (int, writable
-runtime, 0=off/1=follow s_parm), `avm_audio` (bool, 0=off **default**,
-1=register the ALSA card at probe — opt-in until hardware-verified),
+runtime, 1=on default, 0=off), `avm_audio` (bool, 1=on **default**
+since hardware verification 2026-10-16; 0=off),
 `avm_audio_index` (int, -1=auto), `avm_audio_id` (charp, "AVMCV710").
 `softdep: pre: snd-pcm`.
 
@@ -238,11 +238,11 @@ Decision tree (implement based ONLY on the result):
   overlay.  `avm_live_geometry()` (shared by `avm_pixfmt`) falls back to
   `dev->sig` before the first frame locks, then 1920x1080.
 - **Overlays (TODO-3, RESTORED 2026-10-16):** the status worker composites one
-  of the vendor's four 640x480 bitmaps (RLE-decoded from `avmcv710-bmp.h` at
-  the live geometry, then **scaled to fill the frame** — uniform "contain",
-  black letterbox, bilinear luma; the file is generated from the **macOS**
-  rendition in `cv710userspace/assets/` — see `tools/gen_bmp.py`) and delivers
-  it through `avm_deliver_frame()` when the
+  of the vendor's four 640x480 bitmaps (RLE-decoded from `avmcv710-bmp.h`,
+  drawn **1:1 pixel-perfect, centered** on the buffer canvas
+  (`AVM_YUY2_BLACK`), no scaling, no enlargement; the file is generated from
+  the **macOS** rendition in `cv710userspace/assets/` — see `tools/gen_bmp.py`)
+  and delivers it through `avm_deliver_frame()` when the
   stream has been idle > 250 ms (TMDS unlocked → no-signal; locked but out of
   range → out-of-range) **and** when a consumer negotiated a non-native
   geometry the FPGA cannot scale to (`avm_req_mismatch`; the parser drops live
@@ -259,7 +259,8 @@ Decision tree (implement based ONLY on the result):
   install; now provided).  The core maps the vmalloc PCM buffer itself, so
   no `.mmap`/`.page` ops and no vmalloc-helper imports.  The source rate comes
   from the Audio InfoFrame (INFOFRAME page, slave 0x3e; 2026-10-16).
-- **Converter (CVX8897):** opt-in `cvx8897=1`.  `avm_cvx8897_half_rate()` maps
+- **Converter (CVX8897):** on by default (`cvx8897`, runtime-writable).
+  `avm_cvx8897_half_rate()` maps
   (w,h,fps,rgb) to a table; 1080p→60:30/50:25, 720p→same (including dedicated
   720p60 RGB table via HDMI 0x34 reg 0x53), other geometries 60→30 only;
   canned for interlaced.  Programs I2C 7-bit 0x18 + PCA9539 (0x74) reset
@@ -309,8 +310,9 @@ Decision tree (implement based ONLY on the result):
 | TODO-3 | No-signal/out-of-range overlays | **restored 2026-10-16** (RLE-stored bitmaps, composited at the live geometry) — **user test pending** |
 | TODO-4 | Soft-reload / probe -110 timeout | probe timeout -110 after wedged EP1; auto-recovery module param `auto_reset` (default 0=off); test pending after replug |
 | PARSER-PAD | Short frames black-padded (`AVM_PAD_WORD` 0x80108010) to the mode geometry; invented `40000` floor removed | done 2026-10-16 — **user test pending** |
-| FPS-MENU | Frame-interval menu now = {native, native/2} (half only with `cvx8897=1`) | done 2026-10-16 — **user test pending** |
-| RES-OVERLAY | Non-native resolution: vendor paints `aver_custom_out_of_range.bmp`; we show the same overlay via `avm_req_mismatch` | done 2026-10-16 — **user test pending** |
+| FPS-MENU | Frame-interval menu = {native input rate, native/2 when a CVX8897 half-rate table exists}; S_PARM passes through unclamped (half request engages the converter, everything else native) — the fake 9-rate DirectShow menu and the 24 fps black-screen drop-hack are gone (2026-10-17) | done — **user test pending** |
+| RES-OVERLAY | Non-native resolution: vendor paints `aver_custom_out_of_range.bmp`; we show the same overlay via `avm_req_mismatch` when the consumer pinned a geometry, and the parser drops rasters whose geometry differs from the streaming-buffer snapshot (`qfmt`) — no stride shear is possible | done — **user test pending** |
+| FOLLOW-SRC | OBS "leave unchanged": the consumer accepts the live geometry (`follow_source`), and a mid-stream source resolution change is published into `dev->fmt` + `V4L2_EVENT_SOURCE_CHANGE` so buffers renegotiate automatically at the new raster | done 2026-10-17 — **user test pending** |
 | FRAMING-LAYER | Where the vendor parses C0/C1 | resolved 2026-10-16: in the driver, byte-wise marker dispatch (readable in `libC877Driver.dylib`) |
 | BOOTSTRAP-PARITY | Diff 871-cmd replay vs `CRXADV7604`/`CLFE3` init in the `.sys` | resolved 2026-10-16: replay == reference capture (0 diffs), trim state-preserving (132 regs), EDID byte-identical to the vendor binaries — `tools/check_bootstrap.py` |
 | — | 2026-10-12 bug-hunt fixes (8 bugs: unload pin, adaptive-mode dead delivery, sequence race, adapter shared scratch mode, URB fail-path leak, status-work pre-init cancel, bootstrap scratch guard, audio hw_free barrier) | fixed + committed; see `### 2026-10-12 (late)` devlog entry |
@@ -324,8 +326,10 @@ Decision tree (implement based ONLY on the result):
 | — | Standalone ALSA audio capture | ✅ Refcounted pipeline in `avm_pipeline_start`/`stop`; `arecord` runs standalone without video player active |
 
 Current module identity (for regression diffing): `srcversion
-DE9D17942810A25B0C050D8` (2026-10-16 fix No-Signal Out-of-Range priority & resolution mismatch buffer gating
-— see `docs/DEVLOG.md`), parms `cvx8897`, `avm_audio`
+7FB4588D3997E7F77764BD7` (2026-10-17 fix: honest frame-interval menu, S_PARM
+passthrough, 24 fps drop-hack removed, leave-unchanged format follow + qfmt
+delivery gate — see `docs/DEVLOG.md`), parms `cvx8897`
+(int, 1=on default, 0=off), `avm_audio`
 (bool, default on), `avm_audio_index`, `avm_audio_id`, `auto_reset`
 (bool, default off), `softdep: pre: snd-pcm`, 4×2 MB URBs.  `fix-driver.sh`
 expects this srcversion and prints the `rmmod -f` escape hatch if an

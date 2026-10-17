@@ -1055,3 +1055,82 @@ ship; C877 is the CV710.)
      - In `avmcv710-status.c`, target geometry always aligns with `dev->req_w x dev->req_h` or `dev->fmt`, compositing a pixel-perfect 1:1 centered "Signal Out of Range" overlay at the consumer's buffer size.
      - In `avm_g_fmt()`, when `vb2_is_busy()` (streaming is active), `dev->fmt` is returned without mutation, preventing in-stream geometry desync.
      - When the user selects 720x576 in OBS, `s_fmt` reallocates 720x576 buffers and 576p streams natively and flawlessly.
+### 2026-10-17 — regressions after the fps/res rework: honest interval menu, S_PARM passthrough, leave-unchanged format follow, qfmt delivery gate
+
+User reports on hardware after `7f6d871` + `ad0bd48`: 1080p@50 and @24 broken
+both as OBS framerate picks and as real input modes, and the diagonal-shear
+"lines" regression back after a resolution switch and while exercising the fps
+menu. Three root causes survived in that rework:
+
+1. **Fake interval menu + snapped S_PARM.** `avm_enum_frameintervals()`
+   advertised nine rates (60, 59.94, 50, 30, 29.97, 25, 24, 23.98, 15) that the
+   hardware cannot produce, and `avm_s_parm()` snapped every request onto that
+   menu and forced 60 fps when the consumer left the rate unset. The converter
+   only ever converts 60->30 and 50->25 (progressive), so a picked 50 on a
+   60 Hz input delivers a mislabeled native cadence and a picked 24 hit a
+   hard-coded frame-drop hack: `cvx_req_fps == 24 && measured_fps > 30` dropped
+   *every* frame, black screen until the user turned the rate back up (windows
+   vendor does the same, but the menu should simply never offer it).
+   - `avmcv710-video.c`: the menu is now exactly what the pipeline can deliver
+     for the live geometry: entry 0 is the native input rate
+     (`avm_native_fps()`, measured, or the 60 fps nominal before first lock),
+     entry 1 is that rate halved and offered only when
+     `avm_cvx8897_half_rate()` has a table for the mode (and `cvx8897=1`).
+     `avm_s_parm()` passes the request through unclamped; the converter logic
+     (`avm_cvx_work`) alone decides engagement: about-half -> convert, the
+     input rate itself or nothing -> native passthrough, and g_parm then
+     reports the true measured delivered rate. The 24 fps drop-hack is deleted
+     (a real 24p/50p source still captures natively because entry 0 follows
+     the source).
+2. **The shear gate was keyed to the wrong snapshot.** `ad0bd48` gated live
+   delivery on `avm_req_mismatch()` (req_w/req_h, the last S_FMT). But req and
+   dev->fmt are two different snapshots at one moment: after a "leave
+   unchanged" negotiation that accepted the live raster, the dropping became
+   possible again only by pinning every S_FMT, which killed the
+   V4L2_EVENT_SOURCE_CHANGE renegotiation (OBS stuck on the old buffers,
+   out-of-range until manual re-pick) and reintroduced the shear whenever a
+   frame slipped through before renegotiation.
+   - `avmcv710-video.c`: `start_streaming()` snapshots the allocation geometry
+     into the new `qfmt_w`/`qfmt_h` (`avm_video_register()` inits both to
+     1920x1080).
+   - `avmcv710-parser.c`: the delivery gate now compares the incoming mode
+     against the `qfmt` snapshot, never against `dev->fmt`. A raster whose
+     stride differs from the queued buffers physically cannot reach the
+     consumer, in any state, following or pinned.
+3. **"Leave unchanged" had no resolution detection.** The user ask:
+     its best to leave unchanged option in obs and probably add detection
+     for proper res detection if we use unchanged options
+   - `avmcv710-video.c`: `avm_s_fmt()` records `follow_source` when the
+     consumer accepted the live geometry (OBS "leave unchanged"/Device
+     default maps to this); a user-picked other geometry pins (vendor
+     DirectShow pin behavior, out-of-range stands).
+   - `avmcv710-parser.c`: when the 4-frame hysteresis adopts a new mode and
+     `follow_source` holds, `avm_publish_geometry()` writes the new mode into
+     `dev->fmt` *before* `avm_source_change()` fires, so the consumer's
+     renegotiation lands on the right stride. The `qfmt` gate keeps the
+     transitional frames out until OBS reallocates; the out-of-range splash
+     (`avm_req_mismatch` keyed at req, still the buffer geometry) covers the
+     renegotiation window, then live video returns at the new raster.
+
+**Parity audit of the new fps/res behavior:**
+
+| scenario | vendor | ours now |
+|---|---|---|
+| OBS menus | pin-defined discrete formats and intervals | resolution menu from the DirectShow geometry set; fps menu from the live source: {native, native/2 when a converter table exists} |
+| picked 50 on a 60 Hz input | delivered as the pin said, no hardware path (cadence mislabel) | not offered; picks snap to {60,30} |
+| picked 24 with no converter path | black screen, recovery = raise the rate | not offered; a real 24p input still captures natively at 24 |
+| "leave unchanged" + source res change mid-stream | DirectShow pin cannot resize: out-of-range until a matching pin | dev->fmt follows the source, SOURCE_CHANGE renegotiates OBS buffers, out-of-range splash covers the ~1 s window |
+| explicit 720x576 with a 576p source | native capture | native capture (qfmt gate passes) |
+| source res changes under a pinned geometry | out-of-range card at the pin geometry | out-of-range card at the pinned geometry, frames dropped, no shear |
+
+**Hardware verification (user, after `sudo ./fix-driver.sh`):**
+- OBS fps menu on a 1080p60 input offers exactly 60 and 30 (30 engages the
+  converter, `cvx8897: halving ...` in the journal; 60 native).
+- Real 1080p50 input: capture runs natively at ~50 (g_parm `1/50`, no
+  converter kick); configuring 25 in OBS halves it.
+- Real 1080p24 input: capture runs natively at 24, no black screen.
+- "Leave unchanged" + console switch 1080p -> 576p: brief out-of-range card,
+  then OBS renegotiates and 576p keeps streaming without manual resolution
+  pick; no diagonal shear at any point.
+- Explicit resolution picks still match the vendor: a 720x576 capture on a
+  1080p source shows the out-of-range card until the source matches.

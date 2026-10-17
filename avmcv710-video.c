@@ -128,19 +128,8 @@ bool avm_req_mismatch(struct avm_device *dev, u32 w, u32 h)
 	return rw && rh && (rw != w || rh != h);
 }
 
-static void avm_pixfmt(struct avm_device *dev, struct v4l2_pix_format *pix)
+static void avm_geom_pixfmt(struct v4l2_pix_format *pix, u32 w, u32 h, u8 cs)
 {
-	u32 w, h;
-	u8 cs = 0xFF;
-	unsigned long flags;
-
-	avm_live_geometry(dev, &w, &h);
-
-	spin_lock_irqsave(&dev->sig_lock, flags);
-	if (dev->sig.valid)
-		cs = dev->sig.colorspace;
-	spin_unlock_irqrestore(&dev->sig_lock, flags);
-
 	pix->width = w;
 	pix->height = h;
 	pix->pixelformat = V4L2_PIX_FMT_YUYV;
@@ -171,6 +160,46 @@ static void avm_pixfmt(struct avm_device *dev, struct v4l2_pix_format *pix)
 	pix->priv = 0;
 }
 
+static void avm_pixfmt(struct avm_device *dev, struct v4l2_pix_format *pix)
+{
+	u32 w, h;
+	u8 cs = 0xFF;
+	unsigned long flags;
+
+	avm_live_geometry(dev, &w, &h);
+
+	spin_lock_irqsave(&dev->sig_lock, flags);
+	if (dev->sig.valid)
+		cs = dev->sig.colorspace;
+	spin_unlock_irqrestore(&dev->sig_lock, flags);
+
+	avm_geom_pixfmt(pix, w, h, cs);
+}
+
+/*
+ * Publish a new source geometry into dev->fmt.  Only valid when the
+ * consumer followed the live geometry (follow_source, "leave unchanged"):
+ * the mode-acquisition path in the parser calls this, then queues
+ * V4L2_EVENT_SOURCE_CHANGE, and the consumer renegotiates buffers against
+ * the new geometry.  The queued buffers still carry the old geometry, so
+ * the parser delivery gate (qfmt snapshot) keeps mismatched frames out
+ * until the renegotiation completes.
+ */
+void avm_publish_geometry(struct avm_device *dev, u32 w, u32 h)
+{
+	struct v4l2_pix_format pix;
+	u8 cs = 0xFF;
+	unsigned long flags;
+
+	spin_lock_irqsave(&dev->sig_lock, flags);
+	if (dev->sig.valid)
+		cs = dev->sig.colorspace;
+	spin_unlock_irqrestore(&dev->sig_lock, flags);
+
+	avm_geom_pixfmt(&pix, w, h, cs);
+	dev->fmt = pix;
+}
+
 static int avm_g_fmt(struct file *file, void *fh, struct v4l2_format *f)
 {
 	struct avm_device *dev = video_drvdata(file);
@@ -199,17 +228,7 @@ static const struct {
 	{  640,  480 },
 };
 
-static const struct v4l2_fract avm_frame_intervals[] = {
-	{    1,    60 },	/* 60 fps */
-	{ 1001, 60000 },	/* 59.94 fps */
-	{    1,    50 },	/* 50 fps */
-	{    1,    30 },	/* 30 fps */
-	{ 1001, 30000 },	/* 29.97 fps */
-	{    1,    25 },	/* 25 fps */
-	{    1,    24 },	/* 24 fps */
-	{ 1001, 24000 },	/* 23.98 fps */
-	{    1,    15 },	/* 15 fps */
-};
+/* Standard geometries the DirectShow pin table exposes (resolution menu). */
 
 static int avm_try_fmt(struct file *file, void *fh, struct v4l2_format *f)
 {
@@ -296,6 +315,24 @@ static int avm_s_fmt(struct file *file, void *fh, struct v4l2_format *f)
 	 */
 	WRITE_ONCE(dev->req_w, f->fmt.pix.width);
 	WRITE_ONCE(dev->req_h, f->fmt.pix.height);
+
+	/*
+	 * Decide whether the consumer pinned a geometry or accepted the live
+	 * one.  When it accepted the live geometry (OBS "leave unchanged"),
+	 * a mid-stream source resolution change is followed: the parser
+	 * publishes the new mode into dev->fmt and fires SOURCE_CHANGE so
+	 * the consumer renegotiates buffers at the new raster.  When it
+	 * pinned a different geometry, the vendor behavior holds instead:
+	 * the out-of-range overlay stays up until the source matches.
+	 */
+	{
+		u32 live_w, live_h;
+
+		avm_live_geometry(dev, &live_w, &live_h);
+		WRITE_ONCE(dev->follow_source,
+			   f->fmt.pix.width == live_w &&
+			   f->fmt.pix.height == live_h);
+	}
 	return 0;
 }
 
@@ -386,21 +423,58 @@ static void avm_current_interval(struct avm_device *dev,
 }
 
 /*
- * Frame-interval menu.  Enumerates the standard suite of framerates matching
- * the official Windows driver (60, 59.94, 50, 30, 29.97, 25, 24, 23.98, 15).
+ * Frame-interval menu: only what the hardware can deliver for the live
+ * source geometry.  Entry 0 is the native input rate (measured, or the
+ * 60 fps nominal before the first lock); entry 1 is that rate halved and
+ * is offered only when the CVX8897 has a half-rate table for this mode.
+ * The converter covers nothing else (its tables convert 60->30 and
+ * 50->25, progressive only), and asking for anything between the two
+ * rates (50 on a 60 Hz input, 24 on anything) produced mislabeled
+ * cadences or the vendor's 24 fps black screen, so the impossible rates
+ * are simply not offered.  A true 24p or 50p input still captures
+ * natively: entry 0 follows the source.
  */
 static int avm_enum_frameintervals(struct file *file, void *fh,
 				   struct v4l2_frmivalenum *fiv)
 {
+	struct avm_device *dev = video_drvdata(file);
+	u32 live_w, live_h, native, half;
+	const u8 *table;
+	bool interlaced = false, rgb = false;
+	unsigned long flags;
+
 	if (fiv->pixel_format != V4L2_PIX_FMT_YUYV)
 		return -EINVAL;
 
-	if (fiv->index >= ARRAY_SIZE(avm_frame_intervals))
-		return -EINVAL;
+	avm_live_geometry(dev, &live_w, &live_h);
+	native = avm_native_fps(dev);
+	half = native / 2;
 
-	fiv->type = V4L2_FRMIVAL_TYPE_DISCRETE;
-	fiv->discrete = avm_frame_intervals[fiv->index];
-	return 0;
+	spin_lock_irqsave(&dev->sig_lock, flags);
+	if (dev->sig.valid) {
+		interlaced = dev->sig.interlaced;
+		rgb = dev->sig.rgb;
+	}
+	spin_unlock_irqrestore(&dev->sig_lock, flags);
+
+	if (fiv->index == 0) {
+		fiv->type = V4L2_FRMIVAL_TYPE_DISCRETE;
+		fiv->discrete.numerator = 1;
+		fiv->discrete.denominator = native;
+		return 0;
+	}
+
+	table = avm_cvx8897_enabled() ?
+		avm_cvx8897_half_rate(live_w, live_h, native, rgb,
+				      interlaced) : NULL;
+	if (fiv->index == 1 && table && half) {
+		fiv->type = V4L2_FRMIVAL_TYPE_DISCRETE;
+		fiv->discrete.numerator = 1;
+		fiv->discrete.denominator = half;
+		return 0;
+	}
+
+	return -EINVAL;
 }
 
 static int avm_g_parm(struct file *file, void *fh, struct v4l2_streamparm *p)
@@ -418,35 +492,30 @@ static int avm_g_parm(struct file *file, void *fh, struct v4l2_streamparm *p)
 	return 0;
 }
 
+/*
+ * Pass the frame interval through unclamped.  The converter decides what
+ * actually changes: only a request close to half the measured input rate
+ * engages the CVX8897; the input rate itself, or nothing (g_parm then
+ * reports the measured delivered rate), is native passthrough.  The old
+ * behavior snapped the request onto a canned menu and forced 60 fps when
+ * the consumer left the rate unset, which mislabeled the cadence and
+ * forced rates the converter cannot produce.
+ */
 static int avm_s_parm(struct file *file, void *fh, struct v4l2_streamparm *p)
 {
 	struct avm_device *dev = video_drvdata(file);
 	struct v4l2_fract *tpf = &p->parm.capture.timeperframe;
 	u32 req_fps = 0;
-	int i, best = 0;
-	u64 min_diff = U64_MAX;
 
 	if (p->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 		return -EINVAL;
 
 	if (tpf->numerator && tpf->denominator) {
-		u64 req_us = (u64)tpf->numerator * 1000000ULL / tpf->denominator;
-
-		for (i = 0; i < ARRAY_SIZE(avm_frame_intervals); i++) {
-			u64 cand_us = (u64)avm_frame_intervals[i].numerator * 1000000ULL /
-				      avm_frame_intervals[i].denominator;
-			u64 diff = (req_us > cand_us) ? (req_us - cand_us) : (cand_us - req_us);
-
-			if (diff < min_diff) {
-				min_diff = diff;
-				best = i;
-			}
-		}
-		dev->req_tpf = avm_frame_intervals[best];
-		req_fps = dev->req_tpf.denominator / dev->req_tpf.numerator;
+		req_fps = tpf->denominator / tpf->numerator;
+		dev->req_tpf = *tpf;
 	} else {
-		dev->req_tpf = avm_frame_intervals[0];
-		req_fps = 60;
+		dev->req_tpf.numerator = 0;
+		dev->req_tpf.denominator = 0;
 	}
 
 	WRITE_ONCE(dev->cvx_req_fps, req_fps);
@@ -788,6 +857,15 @@ static int avm_start_streaming(struct vb2_queue *q, unsigned int count)
 {
 	struct avm_device *dev = vb2_get_drv_priv(q);
 
+	/*
+	 * Snapshot the geometry the queued buffers were allocated against.
+	 * The parser delivery gate compares against this snapshot, so
+	 * mismatched rasters can never reach the consumer even while
+	 * follow_source already moved dev->fmt to a new source mode.
+	 */
+	WRITE_ONCE(dev->qfmt_w, READ_ONCE(dev->fmt.width));
+	WRITE_ONCE(dev->qfmt_h, READ_ONCE(dev->fmt.height));
+
 	return avm_pipeline_start(dev, true);
 }
 
@@ -839,6 +917,9 @@ int avm_video_register(struct avm_device *dev)
 	dev->fmt.xfer_func = V4L2_XFER_FUNC_709;
 	dev->req_w = dev->fmt.width;
 	dev->req_h = dev->fmt.height;
+	dev->qfmt_w = dev->fmt.width;
+	dev->qfmt_h = dev->fmt.height;
+	dev->follow_source = false;
 
 	ret = v4l2_device_register(&dev->udev->dev, v4l2_dev);
 	if (ret) {

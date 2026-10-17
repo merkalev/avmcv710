@@ -539,20 +539,6 @@ static void avm_handle_frame_end(struct avm_device *dev, u32 frame_words)
 	WRITE_ONCE(p->last_real_kt, ktime_get());
 	WRITE_ONCE(p->clock_recovering, false);
 
-	/*
-	 * Windows driver parity: when 24 fps is requested from a >30 fps source
-	 * (e.g. 1080p60), the hardware converter has no 24 fps table and the
-	 * Windows driver drops into a black screen ("at 24fps it will completely
-	 * stop working juist black screen, simple fix js turn the fps back up").
-	 * Refreshing last_real_kt above keeps the "No Signal" overlay from firing,
-	 * while dropping the frame here produces the exact black screen.
-	 */
-	if (READ_ONCE(dev->cvx_req_fps) == 24 && READ_ONCE(p->measured_fps) > 30) {
-		p->fields_woven = 0;
-		atomic_inc(&p->dropped_frames);
-		return;
-	}
-
 	/* Mode switch hysteresis: 4 consecutive same-geometry frames. */
 	if (READ_ONCE(p->active_w) == mode->w &&
 	    READ_ONCE(p->active_h) == mode->h) {
@@ -577,6 +563,17 @@ static void avm_handle_frame_end(struct avm_device *dev, u32 frame_words)
 			p->pending_count = 0;
 			p->fields_woven = 0;
 			WRITE_ONCE(p->mode_serial, READ_ONCE(p->mode_serial) + 1);
+			/*
+			 * When the consumer follows the live geometry
+			 * ("leave unchanged"), publish the new mode into
+			 * dev->fmt before the event so the renegotiation
+			 * lands on the right raster.  The queued buffers
+			 * still carry the old geometry, so the delivery
+			 * gate below keeps mismatched frames out until
+			 * the consumer reallocated.
+			 */
+			if (READ_ONCE(dev->follow_source))
+				avm_publish_geometry(dev, mode->w, mode->h);
 			/* tell consumers to re-negotiate the format */
 			avm_source_change(dev);
 			mode_w_changed = false;
@@ -591,11 +588,16 @@ static void avm_handle_frame_end(struct avm_device *dev, u32 frame_words)
 	}
 
 	/*
-	 * The FPGA cannot scale: if the consumer negotiated a geometry other
-	 * than the live raster, live frames cannot be delivered (the standby
-	 * overlay pump, avmcv710-status.c, owns the output in that state).
+	 * The FPGA cannot scale: live frames are only delivered when the
+	 * buffer geometry matches the active raster.  The gate is the
+	 * start_streaming format snapshot (qfmt), not dev->fmt, which may
+	 * already have followed a new source mode before the consumer
+	 * reallocates its buffers.  Mismatched frames are dropped; the
+	 * standby overlay pump (avmcv710-status.c) owns the output while
+	 * the mismatch holds.
 	 */
-	if (avm_req_mismatch(dev, mode->w, mode->h)) {
+	if (READ_ONCE(dev->qfmt_w) != mode->w ||
+	    READ_ONCE(dev->qfmt_h) != mode->h) {
 		p->fields_woven = 0;
 		atomic_inc(&p->dropped_frames);
 		return;

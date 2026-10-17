@@ -14,7 +14,7 @@ result as a standard V4L2 `YUYV` capture node, with an opt-in ALSA capture PCM
 for the embedded audio.
 
 It is the kernel-space sibling of the userspace driver
-[`cv710userspace`](../cv710userspace). That project, together with the
+[`cv710userspace`](https://github.com/merkalev/cv710userspace). That project, together with the
 extracted vendor Windows/macOS drivers, is the behavioural source of truth for
 everything here.
 
@@ -62,7 +62,8 @@ everything here.
   converter can only halve the source rate.
 - **Audio.** Registers an ALSA capture PCM
   (`hw:CARD=AVMCV710`, S16LE stereo). The sink is pinned to the source's
-  sample rate (32 / 44.1 / 48 kHz), read from the HDMI Audio InfoFrame.
+  sample rate (32 / 44.1 / 48 / 88.2 / 96 / 176.4 / 192 kHz), read from the
+  HDMI Audio InfoFrame.
   Enabled by default (`avm_audio=1`). Supports standalone capture (`arecord`)
   without requiring a video player to be running.
 - **Fast bootstrap.** 871 commands replayed over EP1 from a generated table,
@@ -166,8 +167,8 @@ output mode first.
 | `tools/gen_cvx8897.py` | generates `avmcv710-cvx8897.h` |
 
 Protocol details (markers, checksums, chunk size) are in the userspace repo's
-[`PROTOCOL.md`](../cv710userspace/PROTOCOL.md); known hardware limitations are
-in [`ISSUES.md`](../cv710userspace/ISSUES.md).
+[`PROTOCOL.md`](https://github.com/merkalev/cv710userspace/PROTOCOL.md); known hardware limitations are
+in [`ISSUES.md`](https://github.com/merkalev/cv710userspace/ISSUES.md).
 
 ## Kernel safety notes
 
@@ -241,5 +242,5 @@ is written so that no userspace-visible condition can panic the kernel:
 
 GPL-2.0 (`MODULE_LICENSE("GPL")`), as required of a Linux kernel module.
 Structure and protocol knowledge are derived from the MIT-licensed
-[`cv710userspace`](../cv710userspace). See [Legal](#legal) for the overlay
+[`cv710userspace`](https://github.com/merkalev/cv710userspace). See [Legal](#legal) for the overlay
 assets.

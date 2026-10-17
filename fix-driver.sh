@@ -24,7 +24,7 @@ set -u
 
 MOD="avmcv710"
 DRV="/sys/bus/usb/drivers/$MOD"
-EXPECTED_SRC="7FB4588D3997E7F77764BD7"   # 2026-10-17 honest fps menu, leave-unchanged format follow, qfmt delivery gate
+EXPECTED_SRC="7EE25C689A8FEE5A866165D"   # 2026-10-17 audio drift telemetry + full HDMI rate adoption
 
 [ "$(id -u)" -eq 0 ] || { echo "run as root (sudo ./fix-driver.sh)"; exit 1; }
 

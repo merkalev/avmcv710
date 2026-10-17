@@ -539,11 +539,13 @@ static int avm_log_status(struct file *file, void *fh)
 
 	dev_info(&dev->udev->dev, "=== avmcv710 status ===\n");
 	dev_info(&dev->udev->dev,
-		 "  Stream: %s, live=%ux%u%s, req=%ux%u, fps=%u (native=%u)\n",
+		 "  Stream: %s, live=%ux%u%s, req=%ux%u qfmt=%ux%u follow=%u, fps=%u (native=%u)\n",
 		 READ_ONCE(dev->streaming) ? "ACTIVE" : "IDLE",
 		 live_w, live_h,
 		 READ_ONCE(p->active_interlaced) ? "i" : "p",
 		 READ_ONCE(dev->req_w), READ_ONCE(dev->req_h),
+		 READ_ONCE(dev->qfmt_w), READ_ONCE(dev->qfmt_h),
+		 READ_ONCE(dev->follow_source),
 		 READ_ONCE(p->measured_fps), avm_native_fps(dev));
 	dev_info(&dev->udev->dev,
 		 "  ADV7604: valid=%u tmds=%s %ux%u%s cs=0x%02x (%s) aud_lock=%u rate=%u Hz poll_err=%u\n",
@@ -564,6 +566,7 @@ static int avm_log_status(struct file *file, void *fh)
 		 atomic_read(&p->padded_frames),
 		 atomic_read(&p->resync_count),
 		 (long long)atomic64_read(&dev->urb_chunks));
+	avm_audio_log_status(dev);
 	return 0;
 }
 

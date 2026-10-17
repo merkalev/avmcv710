@@ -354,5 +354,6 @@ void avm_deliver_frame(struct avm_device *dev, const u8 *src, u32 words);
 int avm_audio_init(struct avm_device *dev);
 void avm_audio_fini(struct avm_device *dev);
 void avm_audio_push(struct avm_device *dev, const u8 *src, u32 bytes);
+void avm_audio_log_status(struct avm_device *dev);
 
 #endif /* AVM_CV710_H */

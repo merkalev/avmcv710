@@ -248,17 +248,18 @@ Decision tree (implement based ONLY on the result):
   geometry the FPGA cannot scale to (`avm_req_mismatch`; the parser drops live
   frames while the mismatch holds).  The vendor draws its splash host-side;
   synthesizing it as a frame is the closest a bare V4L2 node can do.
-- **Audio (TODO-1), opt-in `avm_audio=1`:** snd-usb-audio push model — parser
+- **Audio (TODO-1), on by default (`avm_audio=1`):** snd-usb-audio push model — parser
   copies 0x58 payload into the PCM DMA buffer, `pointer()` reports the write
   cursor, PCM flagged non-atomic, `snd_pcm_period_elapsed` fired from the
   parser worker.  S16LE stereo; the sink follows the source's rate, read from
-  the Audio InfoFrame by the status poll (32/44.1/48 kHz), instead of a fixed
-  48 kHz.  **Registration is off by
-  default** (the card's missing `ops->prepare` oopsed this kernel — it calls
-  prepare unconditionally — and collapsed the user's audio stack on first
-  install; now provided).  The core maps the vmalloc PCM buffer itself, so
-  no `.mmap`/`.page` ops and no vmalloc-helper imports.  The source rate comes
-  from the Audio InfoFrame (INFOFRAME page, slave 0x3e; 2026-10-16).
+  the Audio InfoFrame by the status poll, full receiver set 32/44.1/48/88.2/
+  96/176.4/192 kHz (2026-10-17; the old 48 kHz cap made >48 kHz sources drift
+  the capture latency).  Drift telemetry + app-vs-source mismatch warnings in
+  `VIDIOC_LOG_STATUS` (`avm_audio_log_status()`).  The core maps the vmalloc
+  PCM buffer itself, so no `.mmap`/`.page` ops and no vmalloc-helper imports.
+  The source rate comes from the Audio InfoFrame (INFOFRAME page, slave 0x3e;
+  2026-10-16).  Production cadence (measured payload byte rate) is reported in
+  the same status line for drift diagnosis.
 - **Converter (CVX8897):** on by default (`cvx8897`, runtime-writable).
   `avm_cvx8897_half_rate()` maps
   (w,h,fps,rgb) to a table; 1080p→60:30/50:25, 720p→same (including dedicated
@@ -326,9 +327,9 @@ Decision tree (implement based ONLY on the result):
 | — | Standalone ALSA audio capture | ✅ Refcounted pipeline in `avm_pipeline_start`/`stop`; `arecord` runs standalone without video player active |
 
 Current module identity (for regression diffing): `srcversion
-7FB4588D3997E7F77764BD7` (2026-10-17 fix: honest frame-interval menu, S_PARM
-passthrough, 24 fps drop-hack removed, leave-unchanged format follow + qfmt
-delivery gate — see `docs/DEVLOG.md`), parms `cvx8897`
+7EE25C689A8FEE5A866165D` (2026-10-17 audio: full HDMI rate adoption + drift
+telemetry; video: honest fps menu, S_PARM passthrough, leave-unchanged format
+follow + qfmt delivery gate — see `docs/DEVLOG.md`), parms `cvx8897`
 (int, 1=on default, 0=off), `avm_audio`
 (bool, default on), `avm_audio_index`, `avm_audio_id`, `auto_reset`
 (bool, default off), `softdep: pre: snd-pcm`, 4×2 MB URBs.  `fix-driver.sh`

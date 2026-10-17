@@ -1134,3 +1134,45 @@ menu. Three root causes survived in that rework:
   pick; no diagonal shear at any point.
 - Explicit resolution picks still match the vendor: a 720x576 capture on a
   1080p source shows the out-of-range card until the source matches.
+
+### 2026-10-17 (later) — audio: latency-drift diagnosis, full rate adoption, cadence telemetry
+
+User: "massive latency and delay issue rn; the latency can sHift or drift
+depending on times". Root cause candidate established from the code:
+
+**Mechanism.** The sink previously advertised and pinned only 32/44.1/48 kHz
+(documented divergence: "sink advertises up to 48 kHz"). But the FPGA forwards
+the HDMI audio clock UNRESAMPLED: the producer streams payload bytes at the
+source's real rate while the consumer drains the PCM at the negotiated rate.
+Any source above 48 kHz (88.2/96/176.4/192 kHz) - or any app negotiation that
+picked 48 kHz before the Audio InfoFrame was read - makes the producer faster
+than the consumer: the 1 MB cyclic ring overruns, the memcpy silently
+overwrites unread samples (capture latency steps forward), and the A/V offset
+drifts forever. Also historically invisible: nothing measured the real
+production cadence, so a wrong rate ran silently.
+
+**Changes (`avmcv710-audio.c`):**
+1. The sink advertises the full HDMI receiver set (32/44.1/48/88.2/96/176.4/192
+   kHz, rate_max 192000) and `avm_audio_source_rate()` adopts every rate the
+   InfoFrame can report, so a >48 kHz source is pinned at its true rate
+   (PipeWire resamples to the graph rate; raw ALSA clients must ask for the
+   real rate). This removes the "up to 48 kHz" divergence.
+2. Production-cadence telemetry: `avm_audio_push()` measures the actual
+   payload byte rate once per second (`measured_bps`), the ground truth about
+   the source audio clock, independent of the InfoFrame.
+3. Drift guard: if the negotiated capture rate differs from the source rate,
+   `audio: capture negotiated N Hz but the source sends M Hz ... capture
+   latency will drift (close and reopen the capture to resync)` fires
+   (rate-limited, once per rate pair). An application that negotiated before
+   the InfoFrame arrived cannot be retuned mid-stream; reopening resyncs.
+4. `VIDIOC_LOG_STATUS` now prints an Audio telemetry line
+   (running, app Hz, source Hz, measured cadence B/s and its Hz equivalent,
+   produced/missed/overruns counts) and the Stream line prints
+   `qfmt` and `follow` (the renegotiation state, so resolution-change log
+   captures are self-contained). Run `v4l2-ctl -d /dev/video0 --log-status`
+   while OBS streams and capture the journal lines.
+
+**Acceptance:** with OBS streaming, the cadence in the Audio line must equal
+(app Hz x 4); `overruns` must stay flat and `missed` must not grow during a
+long capture. Drift with those conditions healthy isolates the consumer side
+(OBS buffering), not the driver.

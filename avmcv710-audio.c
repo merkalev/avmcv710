@@ -48,6 +48,7 @@ MODULE_SOFTDEP("pre: snd-pcm");
 /* Fallback rate: the FPGA forwards the HDMI audio clock untouched, so the
  * sink's real rate is whatever the source sends (see struct avm_signal). */
 #define AVM_AUDIO_RATE		AVM_AUDIO_RATE_DEFAULT
+#define AVM_AUDIO_RATE_MAX	192000	/* full HDMI receiver sink set */
 #define AVM_AUDIO_CHANNELS	2	/* S16LE interleaved stereo */
 #define AVM_AUDIO_RING_BYTES	(1u << 20) /* PCM buffer max: ~5.5 s @ 48k */
 #define AVM_AUDIO_BUFFER_MIN	32768	/* ensure ring >= 4x max 8192 B packet */
@@ -78,6 +79,11 @@ struct avm_audio {
 	u64 produced;			/* stats: total bytes into the buffer */
 	u64 missed;			/* stats: bytes dropped, no consumer */
 	u64 overruns;			/* stats: bytes dropped, buffer full */
+	u32 probe_bytes;		/* production-rate telemetry window */
+	unsigned long probe_j;		/* start of the telemetry window */
+	u32 measured_bps;		/* measured production byte rate */
+	u32 warned_app_rate;		/* drift warning state */
+	u32 warned_src_rate;
 	bool running;			/* PCM triggered START */
 	bool dying;			/* card teardown started */
 };
@@ -95,9 +101,12 @@ static const struct snd_pcm_hardware avm_audio_hw = {
 		SNDRV_PCM_INFO_INTERLEAVED | SNDRV_PCM_INFO_BLOCK_TRANSFER |
 		SNDRV_PCM_INFO_PAUSE | SNDRV_PCM_INFO_RESUME,
 	.formats = SNDRV_PCM_FMTBIT_S16_LE,
-	.rates = SNDRV_PCM_RATE_32000 | SNDRV_PCM_RATE_44100 | SNDRV_PCM_RATE_48000,
+	.rates = SNDRV_PCM_RATE_32000 | SNDRV_PCM_RATE_44100 |
+		 SNDRV_PCM_RATE_48000 | SNDRV_PCM_RATE_88200 |
+		 SNDRV_PCM_RATE_96000 | SNDRV_PCM_RATE_176400 |
+		 SNDRV_PCM_RATE_192000,
 	.rate_min = 32000,
-	.rate_max = AVM_AUDIO_RATE,
+	.rate_max = AVM_AUDIO_RATE_MAX,
 	.channels_min = AVM_AUDIO_CHANNELS,
 	.channels_max = AVM_AUDIO_CHANNELS,
 	.buffer_bytes_max = AVM_AUDIO_RING_BYTES,
@@ -112,6 +121,13 @@ static const struct snd_pcm_hardware avm_audio_hw = {
  * The source's sample rate, when the status poll has seen one the sink can
  * carry.  0 = not known yet, and the application is then free to pick any
  * advertised rate (the previous fixed-48 kHz behaviour).
+ *
+ * The full HDMI InfoFrame set is accepted, up through 192 kHz: the FPGA
+ * forwards the source's audio clock unresampled, so keeping only up to
+ * 48 kHz while the source ran higher produced the reported A/V latency
+ * drift: the producer streams at the source's byte rate while the consumer
+ * drains at 48 kHz, the cyclic buffer overruns and capture latency steps
+ * forward forever.
  */
 static u32 avm_audio_source_rate(struct avm_audio *a)
 {
@@ -127,6 +143,10 @@ static u32 avm_audio_source_rate(struct avm_audio *a)
 	case 32000:
 	case 44100:
 	case 48000:
+	case 88200:
+	case 96000:
+	case 176400:
+	case 192000:
 		return rate;
 	default:
 		return 0;
@@ -206,7 +226,9 @@ static int avm_audio_pcm_hw_params(struct snd_pcm_substream *subs,
 	/* the hw constraints already pin these; belt and braces */
 	if (params_format(params) != SNDRV_PCM_FORMAT_S16_LE ||
 	    params_channels(params) != AVM_AUDIO_CHANNELS ||
-	    (rate != 48000 && rate != 44100 && rate != 32000))
+	    (rate != 32000 && rate != 44100 && rate != 48000 &&
+	     rate != 88200 && rate != 96000 && rate != 176400 &&
+	     rate != 192000))
 		return -EINVAL;
 	return 0;
 }
@@ -380,12 +402,14 @@ void avm_audio_push(struct avm_device *dev, const u8 *src, u32 bytes)
 	u32 size, pos, first;
 	u64 before;
 	unsigned int periods = 0;
-	bool mute;
+	bool mute, warn_drift = false;
+	u32 src_rate, app_rate = 0;
 
 	if (!a || !bytes)
 		return;
 
 	mute = avm_audio_muted(dev);
+	src_rate = avm_audio_source_rate(a);
 
 	spin_lock_irqsave(&a->lock, flags);
 	/* no consumer (never opened / stopped / dying): drop on the floor */
@@ -444,6 +468,46 @@ void avm_audio_push(struct avm_device *dev, const u8 *src, u32 bytes)
 	a->base += bytes;
 	a->produced += bytes;
 
+	/*
+	 * Production-rate telemetry: measure the byte rate the source is
+	 * actually streaming into the buffer (the FPGA forwards the HDMI
+	 * audio clock unresampled, so this is the ground truth about the
+	 * source rate, independent of the Audio InfoFrame).  Nominal rate
+	 * for S16LE stereo is samples_per_sec * 4 bytes.
+	 */
+	a->probe_bytes += bytes;
+	if (a->probe_j) {
+		u32 dt_ms = jiffies_to_msecs(jiffies - a->probe_j);
+
+		if (dt_ms >= 1000) {
+			u32 bps = a->probe_bytes * 1000UL / dt_ms;
+
+			if (bps)
+				a->measured_bps = bps;
+			a->probe_bytes = 0;
+			a->probe_j = jiffies;
+		}
+	} else {
+		a->probe_j = jiffies;
+		a->probe_bytes = 0;
+	}
+
+	/*
+	 * A/V drift guard: when the application negotiated a rate other
+	 * than what the source is sending, the producer/consumer byte
+	 * rates differ, the cyclic buffer overruns and capture latency
+	 * steps forward forever (the reported "latency shifts" symptom).
+	 * Happens when the app opened before the Audio InfoFrame arrived
+	 * and therefore negotiated with no rate pin in place.
+	 */
+	if (rt->rate && src_rate && rt->rate != src_rate &&
+	    (a->warned_app_rate != rt->rate || a->warned_src_rate != src_rate)) {
+		a->warned_app_rate = rt->rate;
+		a->warned_src_rate = src_rate;
+		warn_drift = true;
+		app_rate = rt->rate;
+	}
+
 	/* one period_elapsed per completed period sweep (a chunk can carry
 	 * several periods' worth of audio; 8192 B / 1920 B period = 4) */
 	if (rt->frame_bits && rt->period_size) {
@@ -454,6 +518,13 @@ void avm_audio_push(struct avm_device *dev, const u8 *src, u32 bytes)
 						 before / pbytes);
 	}
 	spin_unlock_irqrestore(&a->lock, flags);
+
+	if (warn_drift)
+		dev_warn_ratelimited(&dev->udev->dev,
+			"audio: capture negotiated %u Hz but the source sends %u Hz; "
+			"producer/consumer rates differ so capture latency will drift "
+			"(close and reopen the capture to resync)\n",
+			app_rate, src_rate);
 
 	/*
 	 * The substream object outlives the PCM runtime: a concurrent close
@@ -553,4 +624,37 @@ void avm_audio_fini(struct avm_device *dev)
 
 	/* never block disconnect on a running arecord: free when closed */
 	snd_card_free_when_closed(a->card);
+}
+
+/* VIDIOC_LOG_STATUS telemetry: the drift and overrun numbers live here. */
+void avm_audio_log_status(struct avm_device *dev)
+{
+	struct avm_audio *a = READ_ONCE(dev->audio);
+	unsigned long flags;
+	u64 produced, missed, overruns;
+	u32 measured_bps, app_rate = 0, src_rate;
+	bool running = false;
+
+	src_rate = a ? avm_audio_source_rate(a) : 0;
+	if (!a) {
+		dev_info(&dev->udev->dev,
+			 "  Audio: not registered (avm_audio=0)\n");
+		return;
+	}
+
+	spin_lock_irqsave(&a->lock, flags);
+	produced = a->produced;
+	missed = a->missed;
+	overruns = a->overruns;
+	measured_bps = a->measured_bps;
+	running = a->running && a->substream && a->substream->runtime;
+	if (running)
+		app_rate = a->substream->runtime->rate;
+	spin_unlock_irqrestore(&a->lock, flags);
+
+	dev_info(&dev->udev->dev,
+		 "  Audio: %s app=%u Hz source=%u Hz cadence=%u B/s (%u Hz equiv) produced=%llu missed=%llu overruns=%llu\n",
+		 running ? "RUNNING" : "idle", app_rate, src_rate,
+		 measured_bps, measured_bps / 4, (u64)produced, (u64)missed,
+		 (u64)overruns);
 }
